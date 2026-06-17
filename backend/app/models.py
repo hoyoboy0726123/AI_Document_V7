@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -296,3 +296,53 @@ class DocumentNote(BaseMixin, Base):
 
     document: Mapped[Document] = relationship("Document", back_populates="notes")
     user: Mapped[Optional[User]] = relationship("User")
+
+
+class KGEntity(BaseMixin, Base):
+    """
+    Knowledge graph node — a canonicalized spec identifier or term
+    (e.g. "ISO 9001:2015", "MIL-STD-810G", "IEC 60068-2-30").
+    """
+    __tablename__ = "kg_entities"
+    __table_args__ = (
+        UniqueConstraint("canonical_id", name="uq_kg_entity_canonical"),
+        Index("idx_kg_entity_type", "type"),
+    )
+
+    canonical_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), default=dict, nullable=False)
+
+    src_relations: Mapped[List["KGRelation"]] = relationship(
+        "KGRelation", foreign_keys="KGRelation.src_id", back_populates="src", cascade="all, delete-orphan"
+    )
+    dst_relations: Mapped[List["KGRelation"]] = relationship(
+        "KGRelation", foreign_keys="KGRelation.dst_id", back_populates="dst", cascade="all, delete-orphan"
+    )
+
+
+class KGRelation(BaseMixin, Base):
+    """
+    Knowledge graph edge between two entities. rel_type enum:
+    references | supersedes | defines | requires | derives_from
+    """
+    __tablename__ = "kg_relations"
+    __table_args__ = (
+        Index("idx_kg_relation_src", "src_id"),
+        Index("idx_kg_relation_dst", "dst_id"),
+        Index("idx_kg_relation_type", "rel_type"),
+        UniqueConstraint("src_id", "dst_id", "rel_type", "document_id", name="uq_kg_relation_triple_doc"),
+    )
+
+    src_id: Mapped[str] = mapped_column(String(36), ForeignKey("kg_entities.id"), nullable=False)
+    dst_id: Mapped[str] = mapped_column(String(36), ForeignKey("kg_entities.id"), nullable=False)
+    rel_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("documents.id"), index=True)
+    chunk_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("document_chunks.id"))
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    evidence: Mapped[Optional[str]] = mapped_column(Text)
+
+    src: Mapped["KGEntity"] = relationship("KGEntity", foreign_keys=[src_id], back_populates="src_relations")
+    dst: Mapped["KGEntity"] = relationship("KGEntity", foreign_keys=[dst_id], back_populates="dst_relations")

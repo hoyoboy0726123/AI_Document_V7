@@ -25,3 +25,18 @@ Thumbs.db
 # Local backups (optional)
 QAConsolePage_backup.jsx
 
+# Build / packaging artifacts
+dist/
+build/
+AI_Document_V3_Packaged/
+AI_Document_V3_Packaged.zip
+checksum.txt
+backend/frontend_dist/
+
+# Local tooling / scratch
+.claude/
+.remember/
+TODOS.md
+.lint*.txt
+.lint*.json
+

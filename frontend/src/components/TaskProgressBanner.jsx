@@ -1,11 +1,11 @@
 /**
  * 右下角浮動顯示背景任務進度的 Banner
  */
-import React from "react";
-import { Button, Card, Progress, Space, Tag, Typography } from "antd";
+import { Button, Card, Progress, Space, Tag, Tooltip, Typography } from "antd";
 import { CheckCircleOutlined, CloseOutlined, LoadingOutlined, WarningOutlined } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import { useTaskStatus } from "../contexts/TaskStatusContext";
+import useAuthStore from "../stores/authStore";
 
 const statusIcon = (status) => {
   if (status === "completed") return <CheckCircleOutlined style={{ color: "#52c41a" }} />;
@@ -22,7 +22,10 @@ const statusColor = (status) => {
 const TaskProgressBanner = () => {
   const navigate = useNavigate();
   const { tasks, taskStatuses, removeTask } = useTaskStatus();
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
 
+  // 未登入時不顯示 banner —— 登入頁不該被殘留任務卡住
+  if (!isAuthenticated) return null;
   if (!tasks.length) return null;
 
   return (
@@ -64,7 +67,9 @@ const TaskProgressBanner = () => {
                    taskStatus === "completed" ? "完成" : "失敗"}
                 </Tag>
               </Space>
-              {isDone && (
+              <Tooltip
+                title={isDone ? "關閉提示" : "關閉提示框（背景任務仍會在伺服器跑完，不會中止）"}
+              >
                 <Button
                   type="text"
                   size="small"
@@ -72,7 +77,7 @@ const TaskProgressBanner = () => {
                   onClick={() => removeTask(entry.task_id)}
                   style={{ padding: 0, height: 20 }}
                 />
-              )}
+              </Tooltip>
             </div>
 
             {entry.document_title && (

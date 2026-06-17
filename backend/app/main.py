@@ -17,7 +17,7 @@ setup_logging(
 )
 logger = get_logger(__name__)
 
-from .api.v1 import admin, auth, documents, folders, metadata, rag, tasks, vector_search
+from .api.v1 import admin, agent, auth, documents, folders, kg, metadata, rag, tasks, vector_search
 from .core.config import settings
 from .database import SessionLocal, engine
 from .services import users as user_service
@@ -167,8 +167,87 @@ def ensure_default_admin() -> None:
         db.close()
 
 
+def apply_llm_overrides_from_db() -> None:
+    """
+    Copy LLM/embedding provider settings from system_configs into the in-memory
+    settings object, so the provider factory sees DB values without DB access.
+    Called on startup; admin endpoint also mutates `settings` directly on save.
+    """
+    try:
+        from .services.system_config import SystemConfigService
+
+        db = SessionLocal()
+        try:
+            svc = SystemConfigService(db)
+            overrides = svc.get_llm_provider_config()
+            mapping = {
+                "llm.provider": "LLM_PROVIDER",
+                "llm.model": "LLM_MODEL",
+                "embedding.provider": "EMBEDDING_PROVIDER",
+                "embedding.model": "EMBEDDING_MODEL",
+                "vision.provider": "VISION_PROVIDER",
+                "gemini.api_key": "GEMINI_API_KEY",
+            }
+            for k, attr in mapping.items():
+                if k in overrides:
+                    try:
+                        setattr(settings, attr, overrides[k])
+                    except Exception:
+                        pass
+            # VL 模型同步改 OLLAMA_VISION_MODEL,讓現有 services/ai.py 直接吃到
+            if "vision.model" in overrides and overrides["vision.model"]:
+                try:
+                    setattr(settings, "VISION_MODEL", overrides["vision.model"])
+                    setattr(settings, "OLLAMA_VISION_MODEL", overrides["vision.model"])
+                except Exception:
+                    pass
+            # LLM / Embedding 模型同步到 legacy OLLAMA_* 設定。
+            # services/ai.py 等舊呼叫點直接用 ollama_client.get_client()(讀 OLLAMA_LLM_MODEL /
+            # OLLAMA_EMBED_MODEL),不走 llm_provider 抽象。admin 改模型時若不同步,舊路徑
+            # (如 RAG 答案生成)會繼續用 .env 的舊模型而失敗。僅在 provider=ollama 時鏡像。
+            try:
+                if overrides.get("llm.provider", "ollama") == "ollama" and overrides.get("llm.model"):
+                    setattr(settings, "OLLAMA_LLM_MODEL", overrides["llm.model"])
+                if overrides.get("embedding.provider", "ollama") == "ollama" and overrides.get("embedding.model"):
+                    setattr(settings, "OLLAMA_EMBED_MODEL", overrides["embedding.model"])
+            except Exception:
+                pass
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("apply_llm_overrides_from_db failed: %s", exc)
+
+
+def apply_ocr_overrides_from_db() -> None:
+    """Copy OCR engine settings from system_configs into in-memory settings on startup."""
+    try:
+        from .services.system_config import SystemConfigService
+
+        db = SessionLocal()
+        try:
+            overrides = SystemConfigService(db).get_ocr_config()
+            mapping = {
+                "ocr.engine": "OCR_ENGINE",
+                "ocr.model_tier": "OCR_MODEL_TIER",
+                "ocr.version": "OCR_VERSION",
+                "ocr.device": "OCR_DEVICE",
+            }
+            for k, attr in mapping.items():
+                if k in overrides:
+                    try:
+                        setattr(settings, attr, overrides[k])
+                    except Exception:
+                        pass
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("apply_ocr_overrides_from_db failed: %s", exc)
+
+
 ensure_schema_updates()
 ensure_default_admin()
+apply_llm_overrides_from_db()
+apply_ocr_overrides_from_db()
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -191,6 +270,8 @@ app.include_router(rag.router, prefix="/api/v1/rag", tags=["RAG"])
 app.include_router(vector_search.router, prefix="/api/v1/vector-search", tags=["VectorSearch"])
 app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["Tasks"])
 app.include_router(folders.router, prefix="/api/v1/folders", tags=["Folders"])
+app.include_router(kg.router, prefix="/api/v1/kg", tags=["KnowledgeGraph"])
+app.include_router(agent.router, prefix="/api/v1/agent", tags=["Agent"])
 
 
 @app.get("/")

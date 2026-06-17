@@ -1,5 +1,5 @@
-﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Card, Checkbox, Form, Input, Modal, Progress, Radio, Select, Space, Spin, Upload, Typography, message, Divider } from "antd";
+﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { Alert, Button, Card, Checkbox, Form, Input, Modal, Progress, Select, Space, Spin, Upload, Typography, message, Divider } from "antd";
 import { InboxOutlined, PlusOutlined } from "@ant-design/icons";
 import { useLocation } from "react-router-dom";
 import apiClient from "../../services/api";
@@ -30,6 +30,9 @@ const DocumentForm = ({ document, onSuccess, onCancel, loading = false }) => {
 
   // 強制 VL 視覺解析
   const [forceVision, setForceVision] = useState(false);
+
+  // 強制 PaddleOCR（即使是文字型 PDF）
+  const [forceOcr, setForceOcr] = useState(false);
 
   // 上傳分析任務追蹤
   const [uploadTaskId, setUploadTaskId] = useState(null);
@@ -280,8 +283,8 @@ const DocumentForm = ({ document, onSuccess, onCancel, loading = false }) => {
     const pdfTempPath = form.getFieldValue("source_pdf_path");
     if (pdfTempPath) {
       payload.source_pdf_path = pdfTempPath;
-      // VL 模式下不傳 segments，讓後端在向量化時重新用 VL 解析
-      if (!forceVision && suggestionState?.segments) {
+      // VL / OCR 模式下不傳 segments，讓後端在向量化時重新解析
+      if (!forceVision && !forceOcr && suggestionState?.segments) {
         payload.segments = suggestionState.segments;
       }
       // 傳遞 AI 生成的文件摘要
@@ -290,6 +293,9 @@ const DocumentForm = ({ document, onSuccess, onCancel, loading = false }) => {
       }
       if (forceVision) {
         payload.force_vision = true;
+      }
+      if (forceOcr) {
+        payload.force_ocr = true;
       }
     }
 
@@ -309,7 +315,9 @@ const DocumentForm = ({ document, onSuccess, onCancel, loading = false }) => {
           // 有 task_id → 向量化在背景執行，立刻可以繼續操作
           addTask({ task_id: taskId, document_id: docId, document_title: docTitle });
           message.success(
-            forceVision
+            forceOcr
+              ? "文件已建立，PaddleOCR 辨識正在背景執行，完成後即可搜尋"
+              : forceVision
               ? "文件已建立，VL 視覺解析正在背景執行，可繼續使用系統"
               : "文件已建立，向量索引正在背景執行，稍後即可搜尋"
           );
@@ -627,14 +635,36 @@ const DocumentForm = ({ document, onSuccess, onCancel, loading = false }) => {
       <div style={{ marginBottom: 12 }}>
         <Checkbox
           checked={forceVision}
-          onChange={(e) => setForceVision(e.target.checked)}
-          disabled={uploading}
+          onChange={(e) => {
+            setForceVision(e.target.checked);
+            if (e.target.checked) setForceOcr(false);
+          }}
+          disabled={uploading || forceOcr}
         >
           強制使用視覺模型解析（適合含表格、欄位對齊或大量圖片的 PDF/PPT 轉檔）
         </Checkbox>
         {forceVision && (
           <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
             解析時間較長（每頁約 10–30 秒），圖片內容也會被描述並納入向量索引。
+          </Typography.Text>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 12 }}>
+        <Checkbox
+          checked={forceOcr}
+          onChange={(e) => {
+            setForceOcr(e.target.checked);
+            if (e.target.checked) setForceVision(false);
+          }}
+          disabled={uploading || forceVision}
+        >
+          強制使用 PaddleOCR 辨識（即使是文字型 PDF 也重新走 OCR）
+        </Checkbox>
+        {forceOcr && (
+          <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
+            適合 pdfminer 抽取結果不完整、亂碼、或想統一用 OCR 重做索引的情況；
+            首次執行需下載 PaddleOCR 模型，速度較慢。
           </Typography.Text>
         )}
       </div>

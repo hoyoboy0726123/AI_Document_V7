@@ -1,6 +1,6 @@
-import React, { useMemo } from "react";
+import { useMemo } from "react";
 import { Layout, Menu } from "antd";
-import { FileTextOutlined, AppstoreOutlined, BookOutlined, SettingOutlined, RobotOutlined, ThunderboltOutlined, HeartOutlined } from "@ant-design/icons";
+import { FileTextOutlined, AppstoreOutlined, BookOutlined, SettingOutlined, RobotOutlined, ThunderboltOutlined, HeartOutlined, NodeIndexOutlined } from "@ant-design/icons";
 import { useLocation, useNavigate } from "react-router-dom";
 import FolderTree from "../Folders/FolderTree";
 import useAuthStore from "../../stores/authStore";
@@ -17,6 +17,7 @@ const AppSidebar = () => {
     { key: "/documents", icon: <FileTextOutlined />, label: "文件列表" },
     ...(isAdmin ? [{ key: "/documents/new", icon: <AppstoreOutlined />, label: "建立文件" }] : []),
     { key: "/qa", icon: <RobotOutlined />, label: "RAG智慧問答" },
+    { key: "/knowledge-graph", icon: <NodeIndexOutlined />, label: "知識圖譜" },
     { key: "/notebook", icon: <BookOutlined />, label: "我的筆記本" },
     ...(isAdmin ? [
       { key: "/admin/metadata", icon: <SettingOutlined />, label: "管理介面" },
@@ -29,6 +30,7 @@ const AppSidebar = () => {
     if (location.pathname.startsWith("/documents/new")) return "/documents/new";
     if (location.pathname.startsWith("/documents")) return "/documents";
     if (location.pathname.startsWith("/qa")) return "/qa";
+    if (location.pathname.startsWith("/knowledge-graph")) return "/knowledge-graph";
     if (location.pathname.startsWith("/notebook")) return "/notebook";
     if (location.pathname.startsWith("/admin/vector-health")) return "/admin/vector-health";
     if (location.pathname.startsWith("/admin/vector-search")) return "/admin/vector-search";

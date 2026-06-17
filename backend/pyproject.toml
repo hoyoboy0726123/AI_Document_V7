@@ -24,12 +24,37 @@ dependencies = [
   "pymupdf",
   "Pillow",
   "slowapi",
-  "paddleocr",
-  "paddlepaddle",
+  # PaddleOCR / PaddlePaddle 版本鎖：
+  # paddlepaddle 3.3.x 在 Windows CPU 上 PIR + onednn 新執行器有 regression
+  # (ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttribute<...>])，
+  # 導致 PPStructureV3 layout 模型 predict 失敗。
+  # 上游未修：https://github.com/PaddlePaddle/Paddle/issues/77340
+  # 社群實測可用組合：paddlepaddle 3.2.2 + paddleocr 3.4.1
+  "paddleocr==3.4.1",
+  "paddlepaddle==3.2.2",
+  # PPStructureV3 需要 paddlex[ocr] 的 extras (lxml / beautifulsoup4 / openpyxl /
+  # scikit-learn / scipy / sentencepiece / tiktoken / einops 等)，否則 build pipeline
+  # 會丟 DependencyError。
+  "paddlex[ocr]==3.4.3",
+  # Gemini 雲端 provider 用「現行」官方 SDK；舊的 google-generativeai 已棄用。
+  "google-genai",
+  # RAG rerank（撈寬再精選）：cross-encoder 重排，在 CPU 跑、不與 Ollama 搶 GPU。
+  # torch 鎖 CPU index（見 [tool.uv.sources]），避免誤抓 CUDA 版讓 .exe 暴肥。
+  "torch",
+  "sentence-transformers",
 ]
 
 [tool.uv]
 package = false
+
+# torch 一律從 PyTorch CPU index 取（跨平台都不抓 CUDA 版）。
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

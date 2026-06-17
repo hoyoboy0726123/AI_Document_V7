@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, Descriptions, Select, Space, Spin, Tag, message, Modal, Input, Tabs, Table, Typography, Statistic, Row, Col, Tooltip, Badge, Popconfirm, Slider } from "antd";
 import { FilePdfOutlined, ExclamationCircleOutlined, EditOutlined, DeleteOutlined, BookOutlined, PlusOutlined, MinusOutlined, DatabaseOutlined, ReloadOutlined, MergeCellsOutlined, ScissorOutlined, TagOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
@@ -30,6 +30,9 @@ const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBa
 
   // 重新向量化狀態
   const [reVectorizing, setReVectorizing] = useState(false);
+
+  // 高精度重跑 OCR 狀態
+  const [reocrLoading, setReocrLoading] = useState(false);
 
   // 向量塊管理狀態
   const [chunks, setChunks] = useState(null); // null = 未載入
@@ -160,6 +163,7 @@ const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBa
 
   useEffect(() => {
     fetchDocument();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [documentId]);
 
   // 如果有初始頁面參數（來自搜尋結果），自動開啟 PDF 預覽
@@ -191,6 +195,29 @@ const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBa
           message.error(error.response?.data?.detail ?? '重新向量化失敗');
         } finally {
           setReVectorizing(false);
+        }
+      },
+    });
+  };
+
+  const handleReocr = () => {
+    if (!documentId) return;
+    Modal.confirm({
+      title: '高精度重跑 OCR',
+      icon: <ExclamationCircleOutlined />,
+      content:
+        '將以 server 等級重新辨識此文件（含表格），重建向量索引。準確度最高，但在 CPU 上很慢（每頁約 1 分鐘），背景執行；GPU 正式機會快很多。',
+      okText: '開始重跑',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          setReocrLoading(true);
+          await apiClient.post(`documents/${documentId}/reocr`, { engine: 'rapid', tier: 'server' });
+          message.success('已開始高精度重跑 OCR（背景執行），完成後請重新整理');
+        } catch (error) {
+          message.error(error.response?.data?.detail ?? '重跑 OCR 失敗');
+        } finally {
+          setReocrLoading(false);
         }
       },
     });
@@ -352,12 +379,6 @@ const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBa
     }
   };
 
-  const scoreColor = (score) => {
-    if (score >= 0.8) return "#52c41a";
-    if (score >= 0.5) return "#faad14";
-    return "#ff4d4f";
-  };
-
   const metadataEntries = document ? Object.entries(document.metadata ?? {}) : [];
 
   return (
@@ -373,6 +394,14 @@ const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBa
             type="default"
           >
             重新向量化
+          </Button>
+          <Button
+            onClick={handleReocr}
+            disabled={!document || reocrLoading}
+            loading={reocrLoading}
+            type="default"
+          >
+            高精度重跑 OCR
           </Button>
           <Button onClick={() => onEdit?.(document)} disabled={!document}>
             編輯

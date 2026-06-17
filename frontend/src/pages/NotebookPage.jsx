@@ -1,14 +1,12 @@
-import React, { useEffect, useState } from "react";
-import { Button, Card, Empty, Input, Modal, Space, Spin, Tag, Typography, message } from "antd";
-import { BookOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
+import { useEffect, useState } from "react";
+import { Button, Card, Empty, Input, Modal, Space, Spin, Tag, message } from "antd";
+import { BookOutlined, DeleteOutlined, EditOutlined, ReloadOutlined, SearchOutlined } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 import AppLayout from "../components/Layout/AppLayout";
 import apiClient from "../services/api";
-
-const { Text } = Typography;
 
 const NOTE_COLORS = [
   "#FFF7E0", "#E3F2FD", "#F3E5F5", "#E0F2F1",

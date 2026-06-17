@@ -1,8 +1,11 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Card,
   Button,
+  AutoComplete,
+  Input,
   message,
+  Radio,
   Statistic,
   Row,
   Col,
@@ -12,6 +15,7 @@ import {
   Form,
   InputNumber,
   Switch,
+  Tag,
   Divider,
   Space,
 } from "antd";
@@ -20,13 +24,67 @@ import {
   DeleteOutlined,
   WarningOutlined,
   CheckCircleOutlined,
+  CloudOutlined,
+  ExperimentOutlined,
   SaveOutlined,
   RobotOutlined,
   ThunderboltOutlined,
   ToolOutlined,
   EyeOutlined,
+  FileSearchOutlined,
 } from "@ant-design/icons";
 import apiClient from "../../services/api";
+
+// 預設模型清單(可自由打字覆寫,只是當下拉提示用)
+const PRESET_LLM_OLLAMA = [
+  { label: "Gemma 4 E2B  (2.3B, 128K ctx, 1.5GB)", value: "gemma4:e2b" },
+  { label: "Gemma 4 E4B  (4B, 128K ctx)", value: "gemma4:e4b" },
+  { label: "Gemma 3 12B", value: "gemma3:12b" },
+  { label: "Gemma 3 27B", value: "gemma3:27b" },
+  { label: "Qwen 2.5 7B", value: "qwen2.5:7b" },
+  { label: "Qwen 2.5 14B", value: "qwen2.5:14b" },
+  { label: "Qwen 3 8B", value: "qwen3:8b" },
+  { label: "Llama 3.1 8B", value: "llama3.1:8b" },
+  { label: "Mistral 7B", value: "mistral:7b" },
+];
+
+const PRESET_LLM_GEMINI = [
+  { label: "Gemini 2.5 Flash  (快)", value: "gemini-2.5-flash" },
+  { label: "Gemini 2.5 Pro  (品質高)", value: "gemini-2.5-pro" },
+  { label: "Gemma 3 27B IT  (Google AI Studio)", value: "gemma-3-27b-it" },
+  { label: "Gemma 4 26B A4B  (MoE)", value: "gemma-4-26B-A4B-it" },
+];
+
+const PRESET_EMBED_OLLAMA = [
+  { label: "BGE Large 中文 v1.5  (1024 dim, 中文最強)", value: "quentinz/bge-large-zh-v1.5:latest" },
+  { label: "Qwen3 Embedding 4B", value: "qwen3-embedding:4b" },
+  { label: "MXBai Embed Large  (1024 dim)", value: "mxbai-embed-large" },
+  { label: "Nomic Embed Text  (768 dim)", value: "nomic-embed-text" },
+];
+
+const PRESET_EMBED_GEMINI = [
+  { label: "text-embedding-004  (768 dim, 預設)", value: "text-embedding-004" },
+  { label: "gemini-embedding-001  (3072 dim)", value: "gemini-embedding-001" },
+];
+
+const PRESET_VL_OLLAMA = [
+  { label: "Gemma 4 E2B  (新, 128K ctx, 沒 GGML bug, 細節較弱)", value: "gemma4:e2b" },
+  { label: "Gemma 4 E4B  (新, 128K ctx)", value: "gemma4:e4b" },
+  { label: "Gemma 3 4B  (vision)", value: "gemma3:4b" },
+  { label: "Gemma 3 12B  (vision)", value: "gemma3:12b" },
+  { label: "Gemma 3 27B  (vision, 品質高 / VRAM 大)", value: "gemma3:27b" },
+  { label: "Qwen 2.5-VL 3B  (⚠️ Ollama 0.23.x GGML_ASSERT bug)", value: "qwen2.5vl:3b" },
+  { label: "Qwen 2.5-VL 7B  (⚠️ 同上)", value: "qwen2.5vl:7b" },
+  { label: "MiniCPM-V 8B", value: "minicpm-v:8b" },
+  { label: "Llava 7B", value: "llava:7b" },
+  { label: "Llava 13B", value: "llava:13b" },
+  { label: "Llama 3.2 Vision 11B", value: "llama3.2-vision:11b" },
+];
+
+const filterOption = (input, option) => {
+  const q = (input || "").toLowerCase();
+  return (option?.value || "").toLowerCase().includes(q) || (option?.label || "").toLowerCase().includes(q);
+};
 
 const SystemSettings = () => {
   const [config, setConfig] = useState(null);
@@ -36,6 +94,13 @@ const SystemSettings = () => {
   const [savingVector, setSavingVector] = useState(false);
   const [queryForm] = Form.useForm();
   const [vectorForm] = Form.useForm();
+  const [llmProviderForm] = Form.useForm();
+  const [llmProviderConfig, setLlmProviderConfig] = useState(null);
+  const [savingLlm, setSavingLlm] = useState(false);
+  const [testingLlm, setTestingLlm] = useState(false);
+
+  const [ocrForm] = Form.useForm();
+  const [savingOcr, setSavingOcr] = useState(false);
 
   // 載入系統配置
   const fetchConfig = async () => {
@@ -67,8 +132,122 @@ const SystemSettings = () => {
     }
   };
 
+  const fetchLlmProviderConfig = async () => {
+    try {
+      const resp = await apiClient.get("admin/llm-provider");
+      setLlmProviderConfig(resp.data);
+      llmProviderForm.setFieldsValue({
+        llm_provider: resp.data.llm_provider || "ollama",
+        llm_model: resp.data.llm_model || "",
+        embedding_provider: resp.data.embedding_provider || "ollama",
+        embedding_model: resp.data.embedding_model || "",
+        vision_provider: resp.data.vision_provider || "ollama",
+        vision_model: resp.data.vision_model || "",
+        gemini_api_key: "", // never echo back
+      });
+    } catch (e) {
+      // silent — endpoint may be admin-only or backend unreachable
+    }
+  };
+
+  const handleSaveLlmProvider = async (values) => {
+    setSavingLlm(true);
+    try {
+      const payload = {
+        llm_provider: values.llm_provider,
+        llm_model: values.llm_model || null,
+        embedding_provider: values.embedding_provider,
+        embedding_model: values.embedding_model || null,
+        vision_provider: values.vision_provider || "ollama",
+        vision_model: values.vision_model || null,
+      };
+      // Only send API key if user typed something — empty string clears
+      if (values.gemini_api_key && values.gemini_api_key.trim()) {
+        payload.gemini_api_key = values.gemini_api_key.trim();
+      }
+      await apiClient.put("admin/llm-provider", payload);
+      message.success("LLM 設定已儲存,下一次呼叫將使用新後端");
+      llmProviderForm.setFieldsValue({ gemini_api_key: "" });
+      await fetchLlmProviderConfig();
+    } catch (error) {
+      message.error(error.response?.data?.detail ?? "儲存失敗");
+    } finally {
+      setSavingLlm(false);
+    }
+  };
+
+  const handleTestLlmProvider = async () => {
+    setTestingLlm(true);
+    try {
+      const resp = await apiClient.post("admin/llm-provider/test");
+      const d = resp.data || {};
+      if (d.ok) {
+        message.success(`測試成功 (provider=${d.provider}, version=${d.version || "n/a"})`);
+      } else {
+        message.error(`測試失敗：${d.error || "未知錯誤"}`);
+      }
+    } catch (e) {
+      message.error("測試請求失敗：" + (e.response?.data?.detail || e.message));
+    } finally {
+      setTestingLlm(false);
+    }
+  };
+
+  const handleTestVisionProvider = async () => {
+    setTestingLlm(true);
+    try {
+      const resp = await apiClient.post("admin/llm-provider/test-vision");
+      const d = resp.data || {};
+      if (d.ok) {
+        message.success(`VL 模型 '${d.model}' 已下載 (Ollama 共 ${d.available} 個模型)`);
+      } else {
+        const suggestion = d.suggestion?.length ? `\n相似名稱:${d.suggestion.join(", ")}` : "";
+        message.error(`VL 測試失敗:${d.error || "未知錯誤"}${suggestion}`, 8);
+      }
+    } catch (e) {
+      message.error("測試請求失敗:" + (e.response?.data?.detail || e.message));
+    } finally {
+      setTestingLlm(false);
+    }
+  };
+
+  const fetchOcrConfig = async () => {
+    try {
+      const resp = await apiClient.get("admin/ocr-config");
+      ocrForm.setFieldsValue({
+        engine: resp.data.engine || "rapid",
+        model_tier: resp.data.model_tier || "mobile",
+        version: resp.data.version || "PP-OCRv4",
+        device: resp.data.device || "cpu",
+      });
+    } catch (e) {
+      // silent — admin-only or backend unreachable
+    }
+  };
+
+  const handleSaveOcrConfig = async (values) => {
+    setSavingOcr(true);
+    try {
+      await apiClient.put("admin/ocr-config", {
+        engine: values.engine,
+        model_tier: values.model_tier,
+        version: values.version,
+        device: values.device,
+      });
+      message.success("OCR 設定已儲存,下一份文件 OCR 將使用新設定");
+      await fetchOcrConfig();
+    } catch (error) {
+      message.error(error.response?.data?.detail ?? "儲存失敗");
+    } finally {
+      setSavingOcr(false);
+    }
+  };
+
   useEffect(() => {
     fetchConfig();
+    fetchLlmProviderConfig();
+    fetchOcrConfig();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 保存查詢參數配置（立即生效，無需重新向量化）
@@ -248,13 +427,228 @@ const SystemSettings = () => {
             <div>
               <p><strong>Embedding 模型：</strong>用於文本向量化（需要在 .env 中修改 OLLAMA_EMBED_MODEL）</p>
               <p><strong>LLM 模型：</strong>用於生成回答和分析（需要在 .env 中修改 OLLAMA_LLM_MODEL）</p>
-              <p><strong>Vision 模型：</strong>用於處理 PDF 圖片辨識（需要在 .env 中修改 OLLAMA_VISION_MODEL）</p>
+              <p><strong>Vision 模型：</strong>用於處理 PDF 圖片辨識（需要在 .env 中修改 OLLAMA_VISION_MODEL）</p>
             </div>
           }
           type="info"
           showIcon
           style={{ marginTop: 16 }}
         />
+      </Card>
+
+      {/* LLM Provider 設定 */}
+      <Card
+        title={
+          <span>
+            <CloudOutlined style={{ marginRight: 8 }} />
+            LLM Provider 設定
+          </span>
+        }
+        style={{ marginBottom: 16 }}
+        extra={
+          llmProviderConfig?.gemini_api_key_set && (
+            <Tag color="green">Gemini Key 已設定</Tag>
+          )
+        }
+      >
+        <Alert
+          message="可獨立切換 LLM 與 Embedding 的後端"
+          description={
+            <div>
+              <p><strong>LLM:</strong> 給 Agent / RAG 回答用 — 本地 Ollama 私密但慢、Gemini 雲端快但需要 API key。</p>
+              <p><strong>Embedding:</strong> 文件向量化用 — 建議留 Ollama 本地,免重打 API、向量維度也不會變。</p>
+              <p style={{ marginBottom: 0 }}><strong>注意:</strong>切換 embedding 後端後,舊向量會跟新模型不相容,需重新向量化所有文件。</p>
+            </div>
+          }
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+
+        <Form
+          form={llmProviderForm}
+          layout="vertical"
+          onFinish={handleSaveLlmProvider}
+          initialValues={{ llm_provider: "ollama", embedding_provider: "ollama" }}
+        >
+          <Row gutter={16}>
+            <Col span={8}>
+              <Form.Item label="LLM 後端" name="llm_provider">
+                <Radio.Group size="small">
+                  <Radio.Button value="ollama">Ollama</Radio.Button>
+                  <Radio.Button value="gemini">Gemini</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+              <Form.Item
+                noStyle
+                shouldUpdate={(prev, curr) => prev.llm_provider !== curr.llm_provider}
+              >
+                {({ getFieldValue }) => (
+                  <Form.Item
+                    label="LLM 模型 ID"
+                    name="llm_model"
+                    extra="可從下拉選或自行輸入。空 = 用 .env 預設"
+                  >
+                    <AutoComplete
+                      options={getFieldValue("llm_provider") === "gemini" ? PRESET_LLM_GEMINI : PRESET_LLM_OLLAMA}
+                      placeholder="例:gemma4:e2b"
+                      filterOption={filterOption}
+                      allowClear
+                    />
+                  </Form.Item>
+                )}
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item label="Embedding 後端" name="embedding_provider">
+                <Radio.Group size="small">
+                  <Radio.Button value="ollama">Ollama</Radio.Button>
+                  <Radio.Button value="gemini">Gemini</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+              <Form.Item
+                noStyle
+                shouldUpdate={(prev, curr) => prev.embedding_provider !== curr.embedding_provider}
+              >
+                {({ getFieldValue }) => (
+                  <Form.Item
+                    label="Embedding 模型 ID"
+                    name="embedding_model"
+                    extra="切換後舊向量與新模型不相容,需重跑向量化"
+                  >
+                    <AutoComplete
+                      options={getFieldValue("embedding_provider") === "gemini" ? PRESET_EMBED_GEMINI : PRESET_EMBED_OLLAMA}
+                      placeholder="例:bge-large-zh-v1.5"
+                      filterOption={filterOption}
+                      allowClear
+                    />
+                  </Form.Item>
+                )}
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item label="VL 後端" name="vision_provider">
+                <Radio.Group size="small">
+                  <Radio.Button value="ollama">Ollama</Radio.Button>
+                  <Radio.Button value="gemini" disabled>Gemini (TODO)</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+              <Form.Item
+                label={<Space>VL 模型 ID <EyeOutlined /></Space>}
+                name="vision_model"
+                extra="圖片型 PDF 用。下拉內已含主流 vision 模型"
+              >
+                <AutoComplete
+                  options={PRESET_VL_OLLAMA}
+                  placeholder="例:gemma4:e2b"
+                  filterOption={filterOption}
+                  allowClear
+                  popupMatchSelectWidth={420}
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item
+            label="Gemini API Key"
+            name="gemini_api_key"
+            extra={
+              llmProviderConfig?.gemini_api_key_set
+                ? `目前已設定 (${llmProviderConfig.gemini_api_key_preview}) — 留空保留,輸入新值會覆寫。`
+                : "從 Google AI Studio 取得 — https://aistudio.google.com/apikey"
+            }
+          >
+            <Input.Password placeholder="留空保留原設定" autoComplete="off" />
+          </Form.Item>
+          <Divider />
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit" icon={<SaveOutlined />} loading={savingLlm}>
+                儲存設定
+              </Button>
+              <Button icon={<ExperimentOutlined />} onClick={handleTestLlmProvider} loading={testingLlm}>
+                測試 LLM 連線
+              </Button>
+              <Button icon={<EyeOutlined />} onClick={handleTestVisionProvider} loading={testingLlm}>
+                測試 VL 模型
+              </Button>
+              <Button onClick={() => llmProviderForm.resetFields()}>重置</Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Card>
+
+      {/* OCR 引擎設定 */}
+      <Card
+        title={
+          <span>
+            <FileSearchOutlined style={{ marginRight: 8 }} />
+            OCR 引擎設定
+          </span>
+        }
+        style={{ marginBottom: 16 }}
+      >
+        <Alert
+          message="圖片型 PDF 的文字／表格辨識引擎"
+          description={
+            <div>
+              <p><strong>引擎:</strong> rapid = 輕量 onnx(RapidLayout+RapidTable+RapidOCR),快(~4s/頁)、無 paddle/segfault;pp_structure = PaddleOCR PP-StructureV3(重、保底)。</p>
+              <p><strong>等級／版本:</strong> mobile+PP-OCRv4 快又乾淨(預設);server+PP-OCRv5 近乎完美但 CPU 上 ~87s/頁(GPU 才實用)。</p>
+              <p style={{ marginBottom: 0 }}><strong>裝置:</strong> cpu 開發機用;gpu 需正式機裝 onnxruntime-gpu(如 5090)。設定只影響「之後新 OCR 的文件」,既有文件可用單份「高精度重跑」。</p>
+            </div>
+          }
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        <Form
+          form={ocrForm}
+          layout="vertical"
+          onFinish={handleSaveOcrConfig}
+          initialValues={{ engine: "rapid", model_tier: "mobile", version: "PP-OCRv4", device: "cpu" }}
+        >
+          <Row gutter={16}>
+            <Col span={6}>
+              <Form.Item label="OCR 引擎" name="engine">
+                <Radio.Group size="small">
+                  <Radio.Button value="rapid">rapid</Radio.Button>
+                  <Radio.Button value="pp_structure">pp_structure</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item label="模型等級" name="model_tier" extra="server 準但慢(CPU)">
+                <Radio.Group size="small">
+                  <Radio.Button value="mobile">mobile</Radio.Button>
+                  <Radio.Button value="server">server</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item label="OCR 版本" name="version">
+                <Radio.Group size="small">
+                  <Radio.Button value="PP-OCRv4">v4</Radio.Button>
+                  <Radio.Button value="PP-OCRv5">v5</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item label="裝置" name="device" extra="gpu 需 onnxruntime-gpu">
+                <Radio.Group size="small">
+                  <Radio.Button value="cpu">cpu</Radio.Button>
+                  <Radio.Button value="gpu">gpu</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit" icon={<SaveOutlined />} loading={savingOcr}>
+                儲存 OCR 設定
+              </Button>
+              <Button onClick={() => fetchOcrConfig()}>重置</Button>
+            </Space>
+          </Form.Item>
+        </Form>
       </Card>
 
       {/* 查詢參數配置（立即生效） */}

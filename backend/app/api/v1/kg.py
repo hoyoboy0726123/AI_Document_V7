@@ -1,0 +1,221 @@
+"""
+Knowledge graph query API. Used by the visualization page and by the Agent
+tools layer (services/agent_tools.py).
+"""
+from __future__ import annotations
+
+from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+
+from ... import models, schemas
+from ...core.security import get_current_user
+from ...database import get_db
+from ...services import kg_pipeline, kg_service
+
+router = APIRouter()
+
+
+def _entity_to_read(e: models.KGEntity) -> schemas.KGEntityRead:
+    return schemas.KGEntityRead.model_validate(e)
+
+
+@router.get("/entities/search", response_model=List[schemas.KGEntityRead])
+def search_entities(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    rows = kg_service.search_entities(db, q, limit=limit)
+    return [_entity_to_read(r) for r in rows]
+
+
+@router.get("/entities/{entity_id}", response_model=schemas.KGEntityRead)
+def get_entity(
+    entity_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    row = db.query(models.KGEntity).filter_by(id=entity_id).first()
+    if not row:
+        # accept canonical_id too
+        row = db.query(models.KGEntity).filter_by(canonical_id=entity_id).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="entity not found")
+    return _entity_to_read(row)
+
+
+@router.get("/entities/{entity_id}/neighbors", response_model=schemas.KGNeighborsResponse)
+def get_entity_neighbors(
+    entity_id: str,
+    hops: int = Query(1, ge=1, le=3),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    center = db.query(models.KGEntity).filter_by(id=entity_id).first()
+    if not center:
+        center = db.query(models.KGEntity).filter_by(canonical_id=entity_id).first()
+    if not center:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="entity not found")
+
+    nodes, edges = kg_service.get_neighbors(db, center.id, hops=hops)
+    node_map = {n.id: n for n in nodes}
+
+    neighbors: List[schemas.KGEntityNeighbor] = []
+    for edge in edges:
+        if edge.src_id == center.id and edge.dst_id != center.id:
+            other = node_map.get(edge.dst_id)
+            direction = "out"
+        elif edge.dst_id == center.id and edge.src_id != center.id:
+            other = node_map.get(edge.src_id)
+            direction = "in"
+        else:
+            continue
+        if not other:
+            continue
+        neighbors.append(
+            schemas.KGEntityNeighbor(
+                entity=_entity_to_read(other),
+                rel_type=edge.rel_type,
+                direction=direction,
+                confidence=edge.confidence,
+                document_id=edge.document_id,
+            )
+        )
+
+    return schemas.KGNeighborsResponse(
+        center=_entity_to_read(center),
+        neighbors=neighbors,
+    )
+
+
+@router.get("/entities/{entity_id}/supersedes-chain", response_model=List[schemas.KGEntityRead])
+def get_supersedes_chain(
+    entity_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    center = db.query(models.KGEntity).filter_by(id=entity_id).first()
+    if not center:
+        center = db.query(models.KGEntity).filter_by(canonical_id=entity_id).first()
+    if not center:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="entity not found")
+    chain = kg_service.get_supersedes_chain(db, center.id)
+    return [_entity_to_read(e) for e in chain]
+
+
+@router.get("/graph", response_model=schemas.KGGraphResponse)
+def get_graph(
+    center: Optional[str] = Query(None, description="entity id or canonical_id; omit for full graph"),
+    hops: int = Query(2, ge=1, le=3),
+    limit: int = Query(500, ge=10, le=2000),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Return a slice of the graph for visualization."""
+    if center:
+        ent = db.query(models.KGEntity).filter_by(id=center).first()
+        if not ent:
+            ent = db.query(models.KGEntity).filter_by(canonical_id=center).first()
+        if not ent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="center entity not found")
+        nodes, edges = kg_service.get_neighbors(db, ent.id, hops=hops, limit_per_hop=limit)
+    else:
+        # full-graph slice — bound by `limit` edges, then resolve nodes
+        edges = db.query(models.KGRelation).limit(limit).all()
+        node_ids = {e.src_id for e in edges} | {e.dst_id for e in edges}
+        nodes = db.query(models.KGEntity).filter(models.KGEntity.id.in_(node_ids)).all() if node_ids else []
+
+    return schemas.KGGraphResponse(
+        nodes=[
+            schemas.KGGraphNode(
+                id=n.id,
+                canonical_id=n.canonical_id,
+                name=n.name,
+                type=n.type,
+            )
+            for n in nodes
+        ],
+        edges=[
+            schemas.KGGraphEdge(
+                src_id=e.src_id,
+                dst_id=e.dst_id,
+                rel_type=e.rel_type,
+                confidence=e.confidence,
+            )
+            for e in edges
+        ],
+    )
+
+
+@router.post("/extract/{document_id}", status_code=status.HTTP_202_ACCEPTED)
+def extract_for_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Kick off KG extraction for a single document. Returns the background task ID."""
+    document = db.query(models.Document).filter_by(id=document_id).first()
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
+
+    task = models.BackgroundTask(
+        task_type="kg_extract",
+        status="pending",
+        progress=0,
+        message="等待 KG 抽取開始...",
+        document_id=document_id,
+        creator_id=current_user.id,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    background_tasks.add_task(kg_pipeline.run_kg_extract_task, task.id, document_id)
+    return {"task_id": task.id, "document_id": document_id}
+
+
+@router.delete("/document/{document_id}/relations", status_code=204)
+def delete_document_relations(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Remove all KG relations sourced from a document. Entities are kept."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="僅管理員可刪除 KG 關係")
+    n = kg_service.delete_kg_for_document(db, document_id)
+    db.commit()
+    return None
+
+
+@router.get("/stats")
+def get_stats(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    total_entities = db.query(models.KGEntity).count()
+    total_relations = db.query(models.KGRelation).count()
+    type_breakdown_rows = (
+        db.query(models.KGEntity.type, models.KGEntity.id)
+        .all()
+    )
+    type_counts: dict = {}
+    for t, _ in type_breakdown_rows:
+        type_counts[t] = type_counts.get(t, 0) + 1
+    rel_breakdown_rows = (
+        db.query(models.KGRelation.rel_type, models.KGRelation.id)
+        .all()
+    )
+    rel_counts: dict = {}
+    for t, _ in rel_breakdown_rows:
+        rel_counts[t] = rel_counts.get(t, 0) + 1
+    return {
+        "total_entities": total_entities,
+        "total_relations": total_relations,
+        "type_counts": type_counts,
+        "rel_counts": rel_counts,
+    }

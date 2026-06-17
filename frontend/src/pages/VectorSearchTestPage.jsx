@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Button, Card, Col, Input, InputNumber, Modal, Row, Select, Slider,
   Space, Spin, Table, Tag, Tooltip, Typography, message,

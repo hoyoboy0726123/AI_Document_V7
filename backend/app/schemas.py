@@ -121,6 +121,7 @@ class DocumentCreate(DocumentBase):
     is_image_based: bool = False  # 是否為圖片型 PDF
     original_filename: Optional[str] = None  # 原始檔案名稱
     force_vision: bool = False  # 建立時用 VL 視覺模型重新解析（在向量化階段執行）
+    force_ocr: bool = False  # 建立時強制走 PaddleOCR（即使是文字型 PDF）
 
 
 class DocumentUpdate(BaseModel):
@@ -325,6 +326,8 @@ class RAGQueryResponse(BaseModel):
     suggested_questions: List[str] = Field(default_factory=list)
     # 是否使用了 AI 備援模式（非文件查詢）
     used_ai_fallback: bool = False
+    # 檢索信心偏低（最相關段落 cross-encoder 分數低於門檻）：answer 已改為「最接近內容＋修正建議」
+    low_confidence: bool = False
 
 
 class MetadataOptionUpdate(BaseModel):
@@ -588,3 +591,69 @@ class TaskRead(BaseModel):
     result: Optional[Dict[str, Any]] = None  # pdf_analyze 任務完成後的分析結果
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+# ── Knowledge Graph ──────────────────────────────────────────────────────────
+
+
+class KGEntityRead(BaseModel):
+    id: str
+    canonical_id: str
+    name: str
+    type: str
+    description: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KGRelationRead(BaseModel):
+    id: str
+    src_id: str
+    dst_id: str
+    rel_type: str
+    document_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    confidence: float
+    evidence: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KGEntityNeighbor(BaseModel):
+    entity: KGEntityRead
+    rel_type: str
+    direction: str   # "out" (src→this neighbor) | "in" (neighbor→src)
+    confidence: float
+    document_id: Optional[str] = None
+
+
+class KGNeighborsResponse(BaseModel):
+    center: KGEntityRead
+    neighbors: List[KGEntityNeighbor]
+
+
+class KGGraphNode(BaseModel):
+    id: str
+    canonical_id: str
+    name: str
+    type: str
+
+
+class KGGraphEdge(BaseModel):
+    src_id: str
+    dst_id: str
+    rel_type: str
+    confidence: float
+
+
+class KGGraphResponse(BaseModel):
+    nodes: List[KGGraphNode]
+    edges: List[KGGraphEdge]
+
+
+# ── Agent ────────────────────────────────────────────────────────────────────
+
+
+class AgentChatRequest(BaseModel):
+    question: str
+    conversation_history: List[Dict[str, Any]] = Field(default_factory=list)
+    max_steps: int = Field(default=8, ge=1, le=15)
+    top_k: int = Field(default=5, ge=1, le=10)

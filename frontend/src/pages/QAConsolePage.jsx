@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Card,
@@ -13,14 +13,17 @@ import {
   Row,
   Select,
   Space,
+  Switch,
   Tag,
+  Timeline,
+  Tooltip,
   TreeSelect,
   Typography,
   Divider,
   Alert,
   message,
 } from "antd";
-import { BulbOutlined, DeleteOutlined, SaveOutlined, SendOutlined, QuestionCircleOutlined, StopOutlined } from "@ant-design/icons";
+import { BulbOutlined, DeleteOutlined, RobotOutlined, SaveOutlined, SendOutlined, QuestionCircleOutlined, StopOutlined, ToolOutlined, EyeOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import AppLayout from "../components/Layout/AppLayout";
@@ -28,7 +31,7 @@ import apiClient from "../services/api";
 import useAuthStore from "../stores/authStore";
 import PdfPreviewModal from "../components/Documents/PdfPreviewModal";
 
-const { Title, Paragraph, Text } = Typography;
+const { Text } = Typography;
 
 const QAConsolePage = () => {
   const [form] = Form.useForm();
@@ -43,6 +46,9 @@ const QAConsolePage = () => {
   const [pdfPreview, setPdfPreview] = useState({ open: false, documentId: null, title: "", page: 1 });
   const [followupQuestion, setFollowupQuestion] = useState("");
   const [expandedSnippets, setExpandedSnippets] = useState({});
+  const [agentMode, setAgentMode] = useState(() => {
+    try { return window.localStorage.getItem("qa_agent_mode") === "1"; } catch { return false; }
+  });
   const [saveNoteModal, setSaveNoteModal] = useState({ visible: false, msg: null });
   const [saveNoteDocId, setSaveNoteDocId] = useState(null);
   const [saveNoteLoading, setSaveNoteLoading] = useState(false);
@@ -54,7 +60,7 @@ const QAConsolePage = () => {
   }, [conversationHistory, streamingMsg?.answer]);
 
   const stopInFlight = () => {
-    try { abortRef.current?.abort(); } catch {}
+    try { abortRef.current?.abort(); } catch { /* ignore */ }
     abortRef.current = null;
     setLoading(false);
     setStreamingMsg(null);
@@ -99,7 +105,7 @@ const QAConsolePage = () => {
       try {
         const persisted = JSON.parse(window.localStorage.getItem("auth-storage") || "{}");
         token = persisted?.state?.token;
-      } catch {}
+      } catch { /* ignore */ }
     }
     return token;
   };
@@ -122,7 +128,7 @@ const QAConsolePage = () => {
 
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
-      try { const err = await resp.json(); detail = err.detail || detail; } catch {}
+      try { const err = await resp.json(); detail = err.detail || detail; } catch { /* ignore */ }
       throw new Error(detail);
     }
 
@@ -149,8 +155,132 @@ const QAConsolePage = () => {
           else if (event.type === "sources") onSources?.(event);
           else if (event.type === "done") onDone?.();
           else if (event.type === "error") onError?.(event.message);
-        } catch {}
+        } catch { /* ignore */ }
       }
+    }
+  };
+
+  // Agent mode — SSE stream from /agent/chat
+  const postAgentStream = async (payload, { onEvent, onFinal, onDone, onError }) => {
+    const token = getToken();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    const resp = await fetch("/api/v1/agent/chat", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try { const err = await resp.json(); detail = err.detail || detail; } catch { /* ignore */ }
+      throw new Error(detail);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE uses double-newline as event boundary
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+
+      for (const block of events) {
+        const lines = block.split("\n");
+        let eventName = "message";
+        let dataStr = "";
+        for (const line of lines) {
+          if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+          else if (line.startsWith("data: ")) dataStr += line.slice(6);
+        }
+        if (!dataStr) continue;
+        try {
+          const data = JSON.parse(dataStr);
+          if (eventName === "final") onFinal?.(data);
+          else if (eventName === "done") onDone?.();
+          else if (eventName === "error") onError?.(data.message || "Agent 失敗");
+          else onEvent?.(eventName, data);
+        } catch {
+          // ignore malformed event
+        }
+      }
+    }
+  };
+
+  const runAgentStream = async (question) => {
+    setLoading(true);
+    setStreamingMsg({
+      question,
+      thinking: "",
+      answer: "",
+      isStreaming: true,
+      thinkingDone: false,
+      sources: [],
+      agentMode: true,
+      agentSteps: [],
+    });
+
+    const historyForAgent = conversationHistory.map((m) => ({
+      question: m.question,
+      answer: m.answer,
+    }));
+
+    try {
+      await postAgentStream({ question, conversation_history: historyForAgent, max_steps: 8, top_k: 5 }, {
+        onEvent: (eventName, data) => {
+          setStreamingMsg((prev) => prev ? {
+            ...prev,
+            agentSteps: [...(prev.agentSteps || []), { event: eventName, ...data }],
+          } : null);
+        },
+        onFinal: (data) => {
+          setStreamingMsg((prev) => prev ? { ...prev, answer: data.text || "", sources: data.sources || [], thinkingDone: true } : null);
+        },
+        onDone: () => {
+          setStreamingMsg((prev) => {
+            if (!prev) return null;
+            const newMsg = {
+              question: prev.question,
+              answer: prev.answer,
+              sources: prev.sources || [],
+              is_followup: false,
+              optimized_query: null,
+              thinking: "",
+              suggested_questions: [],
+              used_ai_fallback: false,
+              agentMode: true,
+              agentSteps: prev.agentSteps || [],
+              timestamp: new Date().toISOString(),
+            };
+            setConversationHistory((h) => [...h, newMsg]);
+            return null;
+          });
+          setLoading(false);
+          abortRef.current = null;
+        },
+        onError: (errMsg) => {
+          message.error(errMsg || "Agent 查詢失敗");
+          setStreamingMsg(null);
+          setLoading(false);
+          abortRef.current = null;
+        },
+      });
+    } catch (err) {
+      const msg = err?.message || "Agent 查詢失敗";
+      if (/abort|cancel/i.test(String(msg))) message.info("已停止查詢"); else message.error(msg);
+      setStreamingMsg(null);
+      setLoading(false);
+      abortRef.current = null;
     }
   };
 
@@ -213,6 +343,13 @@ const QAConsolePage = () => {
   const handleSubmit = async (values) => {
     const question = values.question?.trim();
     if (!question) { message.warning("請輸入問題"); return; }
+    form.setFieldValue("question", "");
+
+    if (agentMode) {
+      await runAgentStream(question);
+      return;
+    }
+
     const { document_id, folder_ids } = decodeDocScope(values.doc_scope);
     const payload = {
       question,
@@ -225,13 +362,23 @@ const QAConsolePage = () => {
       use_ai_fallback: false,
       skip_ai_understanding: true,
     };
-    form.setFieldValue("question", "");
     await runStream(payload, question);
+  };
+
+  const toggleAgentMode = (checked) => {
+    setAgentMode(checked);
+    try { window.localStorage.setItem("qa_agent_mode", checked ? "1" : "0"); } catch { /* ignore */ }
   };
 
   const handleFollowupSubmit = async () => {
     const question = followupQuestion?.trim();
     if (!question) { message.warning("請輸入追問內容"); return; }
+    setFollowupQuestion("");
+    // 追問沿用目前模式：Agent 模式的追問也走 Agent。
+    if (agentMode) {
+      await runAgentStream(question);
+      return;
+    }
     const currentFormValues = form.getFieldsValue();
     const { document_id, folder_ids } = decodeDocScope(currentFormValues.doc_scope);
     const payload = {
@@ -241,48 +388,12 @@ const QAConsolePage = () => {
       project_id: currentFormValues.project_id || null,
       document_id,
       folder_ids,
-      conversation_history: conversationHistory,
+      // API 只接受 {question, answer}；送整包訊息物件（含 sources/agentSteps）會 422。
+      conversation_history: conversationHistory.map((m) => ({ question: m.question, answer: m.answer })),
       use_ai_fallback: false,
       skip_ai_understanding: false,
     };
-    setFollowupQuestion("");
     await runStream(payload, question);
-  };
-
-  const handleAiFallback = async (question) => {
-    const currentFormValues = form.getFieldsValue();
-    const { document_id, folder_ids } = decodeDocScope(currentFormValues.doc_scope);
-    const payload = {
-      question,
-      top_k: currentFormValues.top_k ?? 5,
-      classification_id: currentFormValues.classification_id || null,
-      project_id: currentFormValues.project_id || null,
-      document_id,
-      folder_ids,
-      conversation_history: conversationHistory,
-      use_ai_fallback: true,
-    };
-    setLoading(true);
-    try {
-      const resp = await apiClient.post("rag/query", payload, { signal: new AbortController().signal });
-      const data = resp.data || {};
-      setConversationHistory((prev) => [...prev, {
-        question,
-        answer: data?.answer ?? "",
-        sources: data?.sources ?? [],
-        is_followup: false,
-        optimized_query: null,
-        thinking: "",
-        suggested_questions: [],
-        used_ai_fallback: true,
-        timestamp: new Date().toISOString(),
-      }]);
-    } catch (error) {
-      const msg = error?.message || error?.response?.data?.detail || "查詢失敗";
-      if (!/abort|cancel/i.test(String(msg))) message.error(msg);
-    } finally {
-      setLoading(false);
-    }
   };
 
   const clearHistory = () => {
@@ -522,11 +633,117 @@ const QAConsolePage = () => {
     );
   };
 
+  const renderAgentSteps = (steps, isLive) => {
+    if (!steps || steps.length === 0) {
+      if (isLive) {
+        return (
+          <div style={{ padding: "8px 0 12px" }}>
+            <Text type="secondary" style={{ fontSize: 12, fontStyle: "italic" }}>
+              <RobotOutlined /> Agent 啟動中...
+            </Text>
+          </div>
+        );
+      }
+      return null;
+    }
+    const items = steps
+      .filter((s) => s.event === "thought" || s.event === "tool_call" || s.event === "observation")
+      .map((s) => {
+        if (s.event === "thought") {
+          return {
+            color: "blue",
+            dot: <BulbOutlined style={{ fontSize: 14 }} />,
+            children: (
+              <div>
+                <Text strong style={{ fontSize: 12, color: "#1677ff" }}>思考 #{s.step}</Text>
+                <div style={{ fontSize: 13, color: "#555" }}>{s.text}</div>
+              </div>
+            ),
+          };
+        }
+        if (s.event === "tool_call") {
+          return {
+            color: "purple",
+            dot: <ToolOutlined style={{ fontSize: 14 }} />,
+            children: (
+              <div>
+                <Text strong style={{ fontSize: 12, color: "#722ed1" }}>呼叫 {s.tool}</Text>
+                <pre style={{ fontSize: 11, background: "#f0f0f0", padding: 6, borderRadius: 4, overflow: "auto", maxHeight: 100, marginTop: 4 }}>
+                  {JSON.stringify(s.input || {}, null, 2)}
+                </pre>
+              </div>
+            ),
+          };
+        }
+        // observation
+        const outStr = JSON.stringify(s.output || {}, null, 2);
+        const preview = outStr.length > 400 ? outStr.slice(0, 400) + "..." : outStr;
+        return {
+          color: "green",
+          dot: <EyeOutlined style={{ fontSize: 14 }} />,
+          children: (
+            <div>
+              <Text strong style={{ fontSize: 12, color: "#52c41a" }}>觀察 ({s.tool})</Text>
+              <pre style={{ fontSize: 11, background: "#f6ffed", padding: 6, borderRadius: 4, overflow: "auto", maxHeight: 200, marginTop: 4 }}>
+                {preview}
+              </pre>
+            </div>
+          ),
+        };
+      });
+    return (
+      <Collapse
+        size="small"
+        ghost
+        defaultActiveKey={isLive ? ["agent"] : []}
+        style={{ marginBottom: 8 }}
+        items={[
+          {
+            key: "agent",
+            label: (
+              <Space>
+                <RobotOutlined style={{ color: "#1677ff" }} />
+                <Text strong style={{ fontSize: 13 }}>Agent 推理過程</Text>
+                <Tag color="blue" style={{ fontSize: 11 }}>{items.length} 步</Tag>
+                {isLive && !steps.some((s) => s.event === "final") && (
+                  <Tag color="processing" style={{ fontSize: 11 }}>進行中</Tag>
+                )}
+              </Space>
+            ),
+            children: <Timeline items={items} style={{ marginTop: 8 }} />,
+          },
+        ]}
+      />
+    );
+  };
+
   return (
     <AppLayout>
       <Row gutter={16}>
         <Col xs={24} lg={8}>
-          <Card title="查詢設定" style={{ position: "sticky", top: 16 }}>
+          <Card
+            title="查詢設定"
+            style={{ position: "sticky", top: 16 }}
+            extra={
+              <Tooltip title="一般文件問答用傳統 RAG 即可（答案較完整、附來源、較快）。當問題需要跨規範追關聯（例如「A 引用哪些標準、被誰取代」）或多步推理時，再開啟 Agent。">
+                <Space size={4} style={{ cursor: "help" }}>
+                  <RobotOutlined style={{ color: agentMode ? "#1677ff" : "#999" }} />
+                  <Text style={{ fontSize: 12, color: agentMode ? "#1677ff" : "#999" }}>Agent</Text>
+                  <QuestionCircleOutlined style={{ fontSize: 11, color: "#bbb" }} />
+                  <Switch size="small" checked={agentMode} onChange={toggleAgentMode} />
+                </Space>
+              </Tooltip>
+            }
+          >
+            {agentMode && (
+              <Alert
+                style={{ marginBottom: 12 }}
+                type="info"
+                showIcon
+                message="Agent 模式已啟用"
+                description="會自動跨規範追引用、查版本鏈,單次查詢較慢(3-15s),適合「我這產品要符合什麼?」這類綜合性問題。"
+              />
+            )}
             <Form form={form} layout="vertical" initialValues={{ top_k: 5 }} onFinish={handleSubmit}>
               <Form.Item name="question" label="請輸入問題" rules={[{ required: true, message: "請輸入想查詢的問題" }]}>
                 <Input.TextArea rows={4} placeholder="例：某規範流程？或追問上一題關鍵數值" allowClear onPressEnter={(e) => { if (e.ctrlKey || e.metaKey) { form.submit(); } }} />
@@ -594,12 +811,14 @@ const QAConsolePage = () => {
                         </div>
                       )}
                     </div>
-                    <Card size="small" style={{ background: "#f9f9f9", borderLeft: msg.used_ai_fallback ? "4px solid #faad14" : "4px solid #52c41a" }}>
+                    <Card size="small" style={{ background: "#f9f9f9", borderLeft: msg.agentMode ? "4px solid #1677ff" : (msg.used_ai_fallback ? "4px solid #faad14" : "4px solid #52c41a") }}>
                       {msg.used_ai_fallback && (
                         <Alert message="AI 一般知識回答" description="此答案由 AI 一般知識庫產生，可能不來自系統文件內容" type="warning" showIcon style={{ marginBottom: 12 }} />
                       )}
+                      {/* Agent steps (collapsed in history) */}
+                      {msg.agentMode && renderAgentSteps(msg.agentSteps, false)}
                       {/* Thinking section: collapsed by default in history */}
-                      {renderThinking(msg.thinking, false, true)}
+                      {!msg.agentMode && renderThinking(msg.thinking, false, true)}
                       <div style={{ fontSize: 15, lineHeight: 1.8 }}>
                         <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{msg.answer}</ReactMarkdown>
                       </div>
@@ -633,15 +852,17 @@ const QAConsolePage = () => {
                         </div>
                       )}
                     </div>
-                    <Card size="small" style={{ background: "#f9f9f9", borderLeft: "4px solid #52c41a" }}>
+                    <Card size="small" style={{ background: "#f9f9f9", borderLeft: streamingMsg.agentMode ? "4px solid #1677ff" : "4px solid #52c41a" }}>
+                      {/* Agent steps timeline (when in agent mode) */}
+                      {streamingMsg.agentMode && renderAgentSteps(streamingMsg.agentSteps, true)}
                       {/* Thinking: expanded while thinking, collapsed after done */}
-                      {renderThinking(streamingMsg.thinking, true, streamingMsg.thinkingDone)}
+                      {!streamingMsg.agentMode && renderThinking(streamingMsg.thinking, true, streamingMsg.thinkingDone)}
                       <div style={{ fontSize: 15, lineHeight: 1.8 }}>
                         {streamingMsg.answer ? (
                           <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streamingMsg.answer}</ReactMarkdown>
                         ) : (
                           <Text type="secondary" style={{ fontStyle: "italic" }}>
-                            {streamingMsg.thinkingDone ? "生成回答中..." : "AI 思考中..."}
+                            {streamingMsg.agentMode ? "Agent 推理中..." : (streamingMsg.thinkingDone ? "生成回答中..." : "AI 思考中...")}
                           </Text>
                         )}
                       </div>

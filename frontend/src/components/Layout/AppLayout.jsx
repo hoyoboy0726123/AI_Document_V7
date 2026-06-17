@@ -1,5 +1,4 @@
 
-import React from 'react';
 import { Layout } from 'antd';
 import AppHeader from './AppHeader';
 import AppSidebar from './AppSidebar';

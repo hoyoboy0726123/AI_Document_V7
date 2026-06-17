@@ -12,20 +12,31 @@ from ... import models, schemas
 from ...core.config import settings
 from ...core.security import get_current_user
 from ...database import get_db
-from ...services import ai, pdf_image, vector_store
+from ...services import ai, pdf_image, rerank, retrieval
 from ...services.system_config import SystemConfigService
 
 
 router = APIRouter()
 
 
-def _project_matches(metadata: Dict[str, object], project_id: str) -> bool:
-    value = (metadata or {}).get("project_id")
-    if value is None:
-        return False
-    if isinstance(value, list):
-        return project_id in value
-    return value == project_id
+def _hybrid_filtered(db, payload, search_query, embedding, vector_config, top_k):
+    """Thin adapter → services.retrieval.hybrid_retrieve（檢索邏輯的唯一實作）。"""
+    return retrieval.hybrid_retrieve(
+        db, search_query, embedding, top_k,
+        vector_config=vector_config,
+        document_id=payload.document_id,
+        classification_id=payload.classification_id,
+        project_id=payload.project_id,
+        folder_ids=payload.folder_ids,
+    )
+
+
+def _context_keep_ids(filtered):
+    return retrieval.context_keep_ids(filtered)
+
+
+def _context_text_budgeted(db: Session, chunk, ctx_used: int) -> str:
+    return retrieval.context_text_budgeted(db, chunk, ctx_used)
 
 
 @router.post("/query", response_model=schemas.RAGQueryResponse)
@@ -75,59 +86,19 @@ def query_rag(
     if not embeddings:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="嵌入計算失敗")
 
-    search_results = vector_store.search(
-        embeddings[0], top_k=payload.top_k * vector_config["search_multiplier"]
+    filtered = _hybrid_filtered(
+        db, payload, search_query, embeddings[0], vector_config, payload.top_k
     )
-    if not search_results:
-        return schemas.RAGQueryResponse(answer="目前無可用文件內容", sources=[])
-
-    faiss_ids = [fid for fid, _ in search_results]
-    chunk_rows = (
-        db.query(models.DocumentChunk)
-        .join(models.Document, models.DocumentChunk.document_id == models.Document.id)
-        .filter(models.DocumentChunk.faiss_id.in_(faiss_ids))
-        .all()
-    )
-    chunk_map = {c.faiss_id: c for c in chunk_rows}
-
-    filtered: List[tuple[models.DocumentChunk, float]] = []
-    for fid, score in search_results:
-        if score < vector_config["min_similarity_score"]:
-            continue
-        chunk = chunk_map.get(fid)
-        if not chunk:
-            continue
-        doc = chunk.document
-        if payload.document_id and doc.id != payload.document_id:
-            continue
-        if payload.classification_id and doc.classification_id != payload.classification_id:
-            continue
-        if payload.project_id and not _project_matches(doc.metadata_data or {}, payload.project_id):
-            continue
-        if payload.folder_ids and doc.folder_id not in payload.folder_ids:
-            continue
-        filtered.append((chunk, score))
-        if len(filtered) >= payload.top_k:
-            break
-
     if not filtered:
         return schemas.RAGQueryResponse(answer="找不到符合的內容，請調整關鍵詞或過濾條件", sources=[])
 
-    # 頁碼連續性過濾：同一份文件內，頁距超過閾值的塊直接排除，不傳給 LLM
-    # 跨文件的塊不受此限制（不同文件本來就是獨立來源）
-    PAGE_GAP_FILTER = 5
+    # 頁距過濾（智慧 + 塌縮保護）：命中集中才套用；分散/主命中離群則全納入。
     primary_page = filtered[0][0].page or 0
-    primary_doc_id = filtered[0][0].document_id
-
-    def _should_include(chunk, score) -> bool:
-        if chunk.document_id != primary_doc_id:
-            return True  # 不同文件來源，不過濾
-        if not primary_page or not chunk.page:
-            return True  # 頁碼缺失，無法判斷，保留
-        return abs(chunk.page - primary_page) <= PAGE_GAP_FILTER
+    keep_ids = _context_keep_ids(filtered)
 
     contexts: List[Dict[str, str]] = []
     sources: List[schemas.DocumentChunkSource] = []
+    ctx_used = 0
     for chunk, score in filtered:
         doc = chunk.document
         chunk_page = chunk.page or 0
@@ -144,19 +115,37 @@ def query_rag(
             )
         )
 
-        if not _should_include(chunk, score):
+        if chunk.id not in keep_ids:
             # 加入 sources 讓前端顯示，但不傳入 LLM context
             continue
 
+        text = _context_text_budgeted(db, chunk, ctx_used)
+        ctx_used += len(text)
         contexts.append({
             "source_num": source_num,
             "title": doc.title,
             "page": chunk_page,
             "page_gap": page_gap,
-            "text": chunk.text,
+            "text": text,
         })
 
     final_question = optimized_query or question
+
+    # 低信心 fallback：最相關段落的 cross-encoder 分數都低於門檻 → 不硬答，
+    # 改回「最接近內容 + LLM 動態產生的查詢修正建議」（CE 不可用時 conf=None，照常作答）。
+    conf = rerank.top_relevance(search_query, [c for c, _ in filtered])
+    if conf is not None and conf < getattr(settings, "RAG_LOWCONF_CE_THRESHOLD", 0.15):
+        closest = contexts or [
+            {"title": s.title, "page": s.page, "text": s.snippet} for s in sources[:3]
+        ]
+        return schemas.RAGQueryResponse(
+            answer=ai.low_confidence_answer(final_question, closest),
+            sources=sources,
+            is_followup=is_followup,
+            optimized_query=optimized_query,
+            low_confidence=True,
+        )
+
     history = (
         [{"question": m.question, "answer": m.answer} for m in payload.conversation_history]
         if payload.conversation_history else None
@@ -216,47 +205,10 @@ def query_stream(
         return StreamingResponse(_embed_error(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    search_results = vector_store.search(
-        embeddings[0], top_k=(payload.top_k or 5) * vector_config["search_multiplier"]
-    )
-
-    if not search_results:
-        def _no_content():
-            yield f"data: {json.dumps({'type': 'content', 'text': '目前無可用文件內容'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'sources', 'sources': [], 'is_followup': is_followup, 'optimized_query': optimized_query}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(_no_content(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-    faiss_ids = [fid for fid, _ in search_results]
-    chunk_rows = (
-        db.query(models.DocumentChunk)
-        .join(models.Document, models.DocumentChunk.document_id == models.Document.id)
-        .filter(models.DocumentChunk.faiss_id.in_(faiss_ids))
-        .all()
-    )
-    chunk_map = {c.faiss_id: c for c in chunk_rows}
-
     top_k = payload.top_k or 5
-    filtered: List[tuple] = []
-    for fid, score in search_results:
-        if score < vector_config["min_similarity_score"]:
-            continue
-        chunk = chunk_map.get(fid)
-        if not chunk:
-            continue
-        doc = chunk.document
-        if payload.document_id and doc.id != payload.document_id:
-            continue
-        if payload.classification_id and doc.classification_id != payload.classification_id:
-            continue
-        if payload.project_id and not _project_matches(doc.metadata_data or {}, payload.project_id):
-            continue
-        if payload.folder_ids and doc.folder_id not in payload.folder_ids:
-            continue
-        filtered.append((chunk, score))
-        if len(filtered) >= top_k:
-            break
+    filtered = _hybrid_filtered(
+        db, payload, search_query, embeddings[0], vector_config, top_k
+    )
 
     if not filtered:
         def _no_match():
@@ -266,12 +218,12 @@ def query_stream(
         return StreamingResponse(_no_match(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    PAGE_GAP_FILTER = 5
     primary_page = filtered[0][0].page or 0
-    primary_doc_id = filtered[0][0].document_id
+    keep_ids = _context_keep_ids(filtered)
 
     contexts: List[Dict[str, str]] = []
     sources: List[schemas.DocumentChunkSource] = []
+    ctx_used = 0
     for chunk, score in filtered:
         doc = chunk.document
         chunk_page = chunk.page or 0
@@ -281,10 +233,14 @@ def query_stream(
             document_id=doc.id, title=doc.title, page=chunk.page,
             snippet=chunk.text, score=score,
         ))
-        if chunk.document_id == primary_doc_id and primary_page and chunk.page:
-            if abs(chunk.page - primary_page) > PAGE_GAP_FILTER:
-                continue
-        contexts.append({"source_num": source_num, "title": doc.title, "page": chunk_page, "page_gap": page_gap, "text": chunk.text})
+        if chunk.id not in keep_ids:
+            continue
+        text = _context_text_budgeted(db, chunk, ctx_used)
+        ctx_used += len(text)
+        contexts.append({
+            "source_num": source_num, "title": doc.title, "page": chunk_page, "page_gap": page_gap,
+            "text": text,
+        })
 
     final_question = optimized_query or question
     history = (

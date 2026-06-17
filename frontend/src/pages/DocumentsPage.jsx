@@ -1,5 +1,4 @@
 
-import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import AppLayout from '../components/Layout/AppLayout';
 import DocumentList from '../components/Documents/DocumentList';

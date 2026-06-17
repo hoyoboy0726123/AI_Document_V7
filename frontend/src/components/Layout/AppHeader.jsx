@@ -1,19 +1,10 @@
-import React, { useMemo } from "react";
+import { useMemo } from "react";
 import { Layout, Typography, Button } from "antd";
 import { useLocation } from "react-router-dom";
 import useAuthStore from "../../stores/authStore";
 
 const { Header } = Layout;
 const { Title, Text } = Typography;
-
-const PAGE_TITLES = {
-  "/documents/new": "建立文件",
-  "/documents": "文件列表",
-  "/qa": "RAG 智慧問答",
-  "/admin/vector-health": "向量庫健康",
-  "/admin/vector-search": "向量查詢測試",
-  "/admin": "管理介面",
-};
 
 const AppHeader = () => {
   const { user, logout } = useAuthStore();

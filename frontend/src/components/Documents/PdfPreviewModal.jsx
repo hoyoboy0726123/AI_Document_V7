@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState, useRef } from "react";
+﻿import { useEffect, useMemo, useState, useRef } from "react";
 import { Modal, Space, Button, Typography, Spin, Input, Card, Divider, message, Tag } from "antd";
 import { PlusOutlined, MinusOutlined, LeftOutlined, RightOutlined, RobotOutlined, SendOutlined, EyeOutlined, DeleteOutlined, CopyOutlined, SaveOutlined } from "@ant-design/icons";
 import { Document, Page, pdfjs } from "react-pdf";
@@ -75,6 +75,7 @@ const PdfPreviewModal = ({
         setConversationHistory([]);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialPage, initialHighlightKeyword, documentId]);
 
   const fetchHistory = async () => {
@@ -125,6 +126,7 @@ const PdfPreviewModal = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, pageNumber, numPages]);
 
   useEffect(() => {
@@ -248,7 +250,6 @@ const PdfPreviewModal = ({
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
-      let isThinking = false;
       let thinkingText = "";
       let contentText = "";
 

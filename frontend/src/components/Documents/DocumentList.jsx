@@ -1,5 +1,5 @@
 ﻿
-import React, { useEffect, useRef, useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Breadcrumb,
   Button,
@@ -98,7 +98,7 @@ const KeywordList = ({ keywords }) => {
   );
 };
 
-const DocumentList = ({ onCreate, onView }) => {
+const DocumentList = ({ onView }) => {
   const [searchParams] = useSearchParams();
   const currentFolderId = searchParams.get('folder_id') ?? null; // null = all
 
@@ -220,7 +220,7 @@ const DocumentList = ({ onCreate, onView }) => {
     try {
       const resp = await apiClient.get('documents/classifications');
       setClassifications(resp.data ?? []);
-    } catch {}
+    } catch { /* ignore */ }
   };
 
   const fetchFolders = async () => {
@@ -229,7 +229,7 @@ const DocumentList = ({ onCreate, onView }) => {
       const data = resp.data ?? [];
       setFolders(data);
       foldersRef.current = data;
-    } catch {}
+    } catch { /* ignore */ }
   };
 
   useEffect(() => {
@@ -246,7 +246,6 @@ const DocumentList = ({ onCreate, onView }) => {
   // Also extract options from current-page documents whenever they load
   useEffect(() => {
     if (documents.length > 0) extractAndMergeOptions(documents);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [documents]);
 
   useEffect(() => {
@@ -543,7 +542,7 @@ const DocumentList = ({ onCreate, onView }) => {
         if (currentFolderId === '__root__') {
           items.push({ title: <span><FolderOpenOutlined /> 未歸類</span> });
         } else if (path) {
-          path.forEach((f, i) => {
+          path.forEach((f) => {
             items.push({
               title: (
                 <span>

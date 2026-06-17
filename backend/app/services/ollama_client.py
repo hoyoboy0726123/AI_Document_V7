@@ -688,9 +688,18 @@ class OllamaClient:
         truncate: bool = True,
         dimensions: Optional[int] = None,
     ) -> List[List[float]]:
+        # bge-large-zh-v1.5 上限 512 tokens；中文 ≈ 1 token/char、英文 ≈ 0.25 token/char。
+        # Ollama 的 truncate=True 對此模型實測不可靠，這裡做防護式截斷，保守取 450 字
+        # 以同時覆蓋中文最壞情況並留 buffer。
+        max_chars = 450
+        safe_inputs = [
+            (s or "")[:max_chars] if isinstance(s, str) else str(s or "")[:max_chars]
+            for s in inputs
+        ]
+
         payload: Dict[str, Any] = {
             "model": model or self.default_model,
-            "input": inputs,
+            "input": safe_inputs,
             "keep_alive": self.keep_alive,
             "truncate": truncate,
         }

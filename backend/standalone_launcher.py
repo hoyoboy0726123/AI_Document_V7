@@ -1,0 +1,74 @@
+import os
+import sys
+import uvicorn
+import webbrowser
+from multiprocessing import freeze_support
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from app.main import app as api_app
+
+# 核心路徑雙軌制 (2026 安全版)
+if getattr(sys, "frozen", False):
+    # 打包後路徑：sys._MEIPASS (內部唯讀資源)
+    base_dir = sys._MEIPASS
+    # 執行檔實體所在目錄 (外部讀寫資料)
+    external_dir = os.path.dirname(sys.executable)
+    
+    # 強制清理 sys.path 防範劫持
+    sys.path = [base_dir] + [p for p in sys.path if base_dir in p]
+    
+    # 環境變數覆寫 (確保資料寫在外部)
+    os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(external_dir, 'doc_management.db')}"
+    os.environ["FILE_STORAGE_DIR"] = os.path.join(external_dir, "storage")
+    os.environ["PDF_STORAGE_DIR"] = os.path.join(external_dir, "storage", "documents")
+    os.environ["PDF_TEMP_DIR"] = os.path.join(external_dir, "storage", "tmp")
+    os.environ["FAISS_INDEX_PATH"] = os.path.join(external_dir, "storage", "faiss_index.bin")
+    
+    # 確保存儲目錄存在
+    os.makedirs(os.path.join(external_dir, "storage", "documents"), exist_ok=True)
+    os.makedirs(os.path.join(external_dir, "storage", "tmp"), exist_ok=True)
+    os.makedirs(os.path.join(external_dir, "logs"), exist_ok=True)
+else:
+    # 開發環境路徑
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 靜態資源路徑 (打包後在 sys._MEIPASS 下)
+static_dir = os.path.join(base_dir, "frontend_dist")
+
+# 合併 API 與 前端資源 (修正路徑重複問題)
+# 直接使用從 app.main 匯入的 app，它已經包含了 /api/v1 路由
+app = api_app
+
+# 移除原始 main.py 中的根目錄路由，避免它擋住前端 index.html
+# 使用原地修改 (In-place modification) 因為 app.routes 可能沒有 setter
+routes_to_keep = [r for r in app.routes if getattr(r, "path", None) != "/"]
+app.routes[:] = routes_to_keep
+
+# 掛載前端靜態檔案到根目錄
+if os.path.exists(static_dir):
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+else:
+    @app.get("/")
+    def missing_frontend():
+        return {"error": "Frontend dist not found at " + static_dir}
+
+def start_server():
+    try:
+        print("[Standalone] Starting server at http://127.0.0.1:8000")
+        
+        # 自動開啟瀏覽器
+        webbrowser.open("http://127.0.0.1:8000")
+        
+        # 啟動 Uvicorn
+        uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+    except Exception as e:
+        import traceback
+        print("\n" + "="*50)
+        print("CRITICAL ERROR DURING STARTUP:")
+        traceback.print_exc()
+        print("="*50)
+        input("\nPress Enter to exit...")
+
+if __name__ == "__main__":
+    freeze_support()
+    start_server()

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./FolderTree.css";
 import { Button, Dropdown, Input, Modal, Tree, Typography, message } from "antd";
 import {
@@ -7,7 +7,6 @@ import {
   FolderAddOutlined,
   FolderFilled,
   FolderOpenFilled,
-  FolderOutlined,
   PlusOutlined,
 } from "@ant-design/icons";
 import { useNavigate, useSearchParams } from "react-router-dom";

@@ -1,5 +1,4 @@
 
-import React from 'react';
 import { useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom';
 import AppLayout from '../components/Layout/AppLayout';
 import DocumentDetail from '../components/Documents/DocumentDetail';

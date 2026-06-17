@@ -526,6 +526,226 @@ def clear_all_vectors(
         )
 
 
+@router.get("/llm-provider")
+@router.get("/llm-provider/")
+def get_llm_provider(
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """Read current LLM provider config (DB overrides + .env defaults merged)."""
+    _ = current_admin
+    config_service = SystemConfigService(db)
+    overrides = config_service.get_llm_provider_config()
+    api_key = overrides.get("gemini.api_key") or settings.GEMINI_API_KEY or ""
+    return {
+        "llm_provider": overrides.get("llm.provider") or settings.LLM_PROVIDER,
+        "llm_model": overrides.get("llm.model") or settings.LLM_MODEL or settings.OLLAMA_LLM_MODEL,
+        "embedding_provider": overrides.get("embedding.provider") or settings.EMBEDDING_PROVIDER,
+        "embedding_model": overrides.get("embedding.model") or settings.EMBEDDING_MODEL or settings.OLLAMA_EMBED_MODEL,
+        "vision_provider": overrides.get("vision.provider") or settings.VISION_PROVIDER,
+        "vision_model": overrides.get("vision.model") or settings.OLLAMA_VISION_MODEL,
+        "gemini_api_key_set": bool(api_key),
+        "gemini_api_key_preview": (api_key[:4] + "..." + api_key[-4:]) if len(api_key) > 12 else "",
+        "gemini_llm_model_default": settings.GEMINI_LLM_MODEL,
+        "gemini_embed_model_default": settings.GEMINI_EMBED_MODEL,
+    }
+
+
+@router.put("/llm-provider")
+@router.put("/llm-provider/")
+def update_llm_provider(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """Update LLM provider config. Mutates in-memory settings and forces provider rebuild."""
+    _ = current_admin
+    config_service = SystemConfigService(db)
+
+    # Validate provider names
+    valid_providers = {"ollama", "gemini"}
+    if "llm_provider" in payload and payload["llm_provider"] not in valid_providers:
+        raise HTTPException(status_code=400, detail=f"llm_provider must be one of {valid_providers}")
+    if "embedding_provider" in payload and payload["embedding_provider"] not in valid_providers:
+        raise HTTPException(status_code=400, detail=f"embedding_provider must be one of {valid_providers}")
+    # VL 目前只支援 ollama;預留 gemini 但前端會擋
+    if "vision_provider" in payload and payload["vision_provider"] not in {"ollama", "gemini"}:
+        raise HTTPException(status_code=400, detail="vision_provider must be one of ollama|gemini")
+
+    db_payload = {}
+    if "llm_provider" in payload:
+        db_payload["llm.provider"] = payload["llm_provider"]
+    if "llm_model" in payload:
+        db_payload["llm.model"] = payload["llm_model"]
+    if "embedding_provider" in payload:
+        db_payload["embedding.provider"] = payload["embedding_provider"]
+    if "embedding_model" in payload:
+        db_payload["embedding.model"] = payload["embedding_model"]
+    if "vision_provider" in payload:
+        db_payload["vision.provider"] = payload["vision_provider"]
+    if "vision_model" in payload:
+        db_payload["vision.model"] = payload["vision_model"]
+    if "gemini_api_key" in payload:
+        db_payload["gemini.api_key"] = payload["gemini_api_key"]
+
+    config_service.update_llm_provider_config(db_payload)
+
+    # Mutate in-memory settings so the next get_llm_provider() picks it up
+    attr_map = {
+        "llm_provider": "LLM_PROVIDER",
+        "llm_model": "LLM_MODEL",
+        "embedding_provider": "EMBEDDING_PROVIDER",
+        "embedding_model": "EMBEDDING_MODEL",
+        "vision_provider": "VISION_PROVIDER",
+        "gemini_api_key": "GEMINI_API_KEY",
+    }
+    for k, attr in attr_map.items():
+        if k in payload:
+            try:
+                setattr(settings, attr, payload[k] or None)
+            except Exception:
+                pass
+    # VL 模型同步改 OLLAMA_VISION_MODEL,讓 services/ai.py 直接吃到
+    if "vision_model" in payload and payload["vision_model"]:
+        try:
+            setattr(settings, "VISION_MODEL", payload["vision_model"])
+            setattr(settings, "OLLAMA_VISION_MODEL", payload["vision_model"])
+        except Exception:
+            pass
+
+    # Force rebuild on next call
+    try:
+        from ...services.llm_provider import invalidate as invalidate_providers
+        invalidate_providers()
+    except Exception as exc:
+        logger.warning("provider invalidate failed: %s", exc)
+
+    return {"ok": True}
+
+
+@router.post("/llm-provider/test")
+def test_llm_provider(
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """Send a minimal probe to verify the current LLM provider is reachable."""
+    _ = current_admin
+    try:
+        from ...services.llm_provider import get_llm_provider as _get
+        prov = _get(force_rebuild=True)
+        version = prov.version() or "(no version)"
+        # Try a one-shot chat
+        try:
+            reply = prov.chat([
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "user", "content": "ping"},
+            ])
+        except Exception as e:
+            return {"ok": False, "provider": prov.name, "version": version, "error": str(e)[:200]}
+        return {"ok": True, "provider": prov.name, "version": version, "reply": (reply or "")[:200]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@router.post("/llm-provider/test-vision")
+def test_vision_provider(
+    current_admin=Depends(get_current_admin_user),
+):
+    """
+    Verify the VL model name resolves on the configured Ollama instance.
+    Doesn't actually run inference (no image) — just confirms the model is pulled.
+    """
+    _ = current_admin
+    try:
+        ollama = get_client()
+        target = settings.OLLAMA_VISION_MODEL
+        models = [m.get("model") or m.get("name") for m in ollama.list_models() if m]
+        if not models:
+            return {"ok": False, "model": target, "error": "Ollama 無回應或沒有任何模型 — 確認 Ollama daemon 在跑"}
+        if target in models:
+            return {"ok": True, "model": target, "available": len(models)}
+        # case-insensitive / tag-loose match for friendlier error
+        loose = [m for m in models if m and target.split(":")[0] in m]
+        return {
+            "ok": False,
+            "model": target,
+            "error": f"模型 '{target}' 不在 Ollama 已下載列表",
+            "suggestion": loose[:5] if loose else [],
+            "available_count": len(models),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@router.get("/ocr-config")
+@router.get("/ocr-config/")
+def get_ocr_config(
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """Read current OCR engine config (DB overrides + defaults merged)."""
+    _ = current_admin
+    overrides = SystemConfigService(db).get_ocr_config()
+    return {
+        "engine": overrides.get("ocr.engine") or settings.OCR_ENGINE,
+        "model_tier": overrides.get("ocr.model_tier") or settings.OCR_MODEL_TIER,
+        "version": overrides.get("ocr.version") or settings.OCR_VERSION,
+        "device": overrides.get("ocr.device") or settings.OCR_DEVICE,
+        "options": {
+            "engine": ["rapid", "pp_structure"],
+            "model_tier": ["mobile", "server"],
+            "version": ["PP-OCRv4", "PP-OCRv5"],
+            "device": ["cpu", "gpu"],
+        },
+    }
+
+
+@router.put("/ocr-config")
+@router.put("/ocr-config/")
+def update_ocr_config(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """Update OCR engine config; mutates in-memory settings + invalidates rapid engine cache."""
+    _ = current_admin
+    valid = {
+        "engine": {"rapid", "pp_structure"},
+        "model_tier": {"mobile", "server"},
+        "version": {"PP-OCRv4", "PP-OCRv5"},
+        "device": {"cpu", "gpu"},
+    }
+    for k, allowed in valid.items():
+        if k in payload and payload[k] not in allowed:
+            raise HTTPException(status_code=400, detail=f"{k} must be one of {sorted(allowed)}")
+
+    db_payload = {}
+    attr_map = {
+        "engine": ("ocr.engine", "OCR_ENGINE"),
+        "model_tier": ("ocr.model_tier", "OCR_MODEL_TIER"),
+        "version": ("ocr.version", "OCR_VERSION"),
+        "device": ("ocr.device", "OCR_DEVICE"),
+    }
+    for k, (db_key, attr) in attr_map.items():
+        if k in payload:
+            db_payload[db_key] = payload[k]
+            try:
+                setattr(settings, attr, payload[k])
+            except Exception:
+                pass
+
+    SystemConfigService(db).update_ocr_config(db_payload)
+
+    # rebuild rapid engines on next OCR run with the new tier/version/device
+    try:
+        from ...services.rapid_ocr import invalidate as invalidate_rapid
+        invalidate_rapid()
+    except Exception as exc:
+        logger.warning("rapid_ocr invalidate failed: %s", exc)
+
+    return {"ok": True}
+
+
 @router.put("/vector-config")
 @router.put("/vector-config/")
 def update_vector_config(

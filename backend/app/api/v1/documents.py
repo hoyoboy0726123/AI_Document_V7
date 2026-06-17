@@ -15,7 +15,12 @@ from ...core.config import settings
 from ...core.security import get_current_user, get_current_admin_user
 from ...database import get_db
 from ...services import ai
-from ...services.documents import DocumentService, run_document_finalize_task, run_upload_analysis_task
+from ...services.documents import (
+    DocumentService,
+    run_document_finalize_task,
+    run_document_reocr_task,
+    run_upload_analysis_task,
+)
 from ...services.metadata import MetadataService
 from ...services.pdf_processing import extract_text_and_segments, suggest_keywords
 from ...services.pdf_image import get_pdf_page_count
@@ -293,10 +298,18 @@ def create_document(
             is_image_based=False,
             original_filename=payload.original_filename,
             force_vision=False,
+            force_ocr=False,
         )
 
-        task_type = "vl_vectorize" if payload.force_vision else "vectorize"
-        task_msg = "等待 VL 解析開始..." if payload.force_vision else "等待向量化開始..."
+        if payload.force_ocr:
+            task_type = "ocr_vectorize"
+            task_msg = "等待 PaddleOCR 開始..."
+        elif payload.force_vision:
+            task_type = "vl_vectorize"
+            task_msg = "等待 VL 解析開始..."
+        else:
+            task_type = "vectorize"
+            task_msg = "等待向量化開始..."
 
         bg_task = models.BackgroundTask(
             task_type=task_type,
@@ -310,14 +323,17 @@ def create_document(
         db.commit()
         db.refresh(bg_task)
 
+        # force_ocr/force_vision 都不可重用前端傳來的 pdfminer segments
+        skip_segments = payload.force_vision or payload.force_ocr
         background_tasks.add_task(
             run_document_finalize_task,
             task_id=bg_task.id,
             document_id=document.id,
             pdf_temp_path=payload.source_pdf_path,
             force_vision=payload.force_vision,
-            segments_json=_json.dumps(payload.segments) if payload.segments and not payload.force_vision else None,
+            segments_json=_json.dumps(payload.segments) if payload.segments and not skip_segments else None,
             original_filename=payload.original_filename,
+            force_ocr=payload.force_ocr,
         )
 
         logger.info(f"背景任務已啟動：type={task_type}，task_id={bg_task.id}，document_id={document.id}")
@@ -339,6 +355,7 @@ def create_document(
         is_image_based=payload.is_image_based,
         original_filename=payload.original_filename,
         force_vision=False,
+        force_ocr=False,
     )
 
     logger.info(f"文件創建成功：ID={document.id}，ocr_status={document.ocr_status}")
@@ -1023,6 +1040,54 @@ def re_vectorize_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"重新向量化失敗：{str(exc)}"
         )
+
+
+@router.post("/{document_id}/reocr", response_model=schemas.TaskRead, status_code=status.HTTP_202_ACCEPTED)
+def reocr_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    payload: Optional[dict] = None,
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """高精度重跑單份文件 OCR（預設 engine=rapid, tier=server）→ 重建 chunks + 重新向量化。
+
+    背景執行（server 等級在 CPU 上很慢，GPU 正式機才快）。前端 poll task 進度。
+    """
+    _ = current_admin
+    payload = payload or {}
+    engine = payload.get("engine") or "rapid"
+    tier = payload.get("tier") or "server"
+    if engine not in {"rapid", "pp_structure"}:
+        raise HTTPException(status_code=400, detail="engine must be rapid|pp_structure")
+    if tier not in {"mobile", "server"}:
+        raise HTTPException(status_code=400, detail="tier must be mobile|server")
+
+    doc_service = _doc_service(db)
+    document = _get_document_or_404(doc_service, document_id)
+    if not document.pdf_path or not Path(document.pdf_path).exists():
+        raise HTTPException(status_code=400, detail="此文件沒有可重跑的原始 PDF")
+
+    bg_task = models.BackgroundTask(
+        task_type="reocr",
+        status="pending",
+        progress=0,
+        message=f"等待高精度 OCR（{engine}/{tier}）開始...",
+        document_id=document.id,
+        creator_id=current_admin.id,
+    )
+    db.add(bg_task)
+    db.commit()
+    db.refresh(bg_task)
+
+    background_tasks.add_task(
+        run_document_reocr_task,
+        task_id=bg_task.id,
+        document_id=document.id,
+        ocr_engine=engine,
+        ocr_tier=tier,
+    )
+    return bg_task
 
 
 @router.get("/{document_id}/search-text", response_model=schemas.TextSearchResponse)

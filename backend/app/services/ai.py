@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -10,6 +11,19 @@ from ..core.config import settings
 from .ollama_client import get_client
 
 logger = logging.getLogger(__name__)
+
+
+def effective_rag_budget() -> int:
+    """依實際 OLLAMA_NUM_CTX 動態夾限 RAG context 字數預算。
+
+    input+output 共用同一 context window；此函式回傳「可給 context 的字數上限」，
+    並保留 RAG_OUTPUT_RESERVE_CHARS 給生成，避免 prompt 把視窗塞滿導致模型吐空。
+    （本語料 CJK 為主，約 1 token/字，故直接用 num_ctx 當字數上限的近似。）
+    """
+    nctx = getattr(settings, "OLLAMA_NUM_CTX", None) or 4096
+    reserve = getattr(settings, "RAG_OUTPUT_RESERVE_CHARS", 1800)
+    cap = getattr(settings, "RAG_CONTEXT_BUDGET_CHARS", 6000)
+    return max(1500, min(cap, nctx - reserve))
 
 
 DOCUMENT_SUGGESTION_SCHEMA: Dict[str, Any] = {
@@ -95,6 +109,35 @@ def _chat_with_ollama(
     return result
 
 
+def _chat_with_provider(
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+    response_format: Optional[Any] = None,
+    think: bool = False,
+) -> str:
+    """Provider-aware chat: honour the configured LLM_PROVIDER.
+
+    Ollama keeps its existing path verbatim (including the `think` flag, which
+    is Ollama-specific). Any cloud provider (e.g. Gemini) goes through the
+    provider abstraction so switching providers in admin/.env actually routes
+    RAG synthesis there instead of always hitting Ollama.
+    """
+    from .llm_provider import get_llm_provider
+
+    provider = get_llm_provider()
+    if getattr(provider, "name", "ollama") == "ollama":
+        return _chat_with_ollama(
+            messages, model=model, response_format=response_format, think=think
+        )
+    import time
+    t0 = time.time()
+    result = provider.chat(messages, model=model, format=response_format)
+    logger.info("_chat_with_provider provider=%s elapsed=%.1fs output_len=%d preview=%s",
+                provider.name, time.time() - t0, len(result), repr(result[:120]))
+    return result
+
+
 def _prepare_history(conversation_history: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
     # Local light-weight sanitizer to avoid leaking control tokens into prompts
     import re as _re
@@ -130,7 +173,6 @@ def generate_document_suggestion(
     segments: Optional[List[Dict[str, Any]]] = None,
     max_text_chars: int = 8000,
 ) -> Dict[str, Any]:
-    client = get_client()
     truncated_text = (text or "").strip()[:max_text_chars]
 
     segments_summary = []
@@ -164,10 +206,9 @@ Important segments:
 Return a JSON object strictly following the provided schema.
 """
 
-    raw_response = client.chat(
+    raw_response = _chat_with_provider(
         [{"role": "user", "content": prompt}],
-        model=settings.OLLAMA_LLM_MODEL,
-        format=DOCUMENT_SUGGESTION_SCHEMA,
+        response_format=DOCUMENT_SUGGESTION_SCHEMA,
     )
     payload = _safe_json_loads(raw_response)
 
@@ -197,6 +238,56 @@ def _page_label(block: Dict, idx: int) -> str:
     return f"第 {page} 頁 ⚠️ 頁距 {gap}，可能為不同章節"
 
 
+def _split_md_row(line: str) -> List[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _augment_tables_rowwise(text: str) -> str:
+    """偵測 markdown 管線表格，於該表後附「逐列 key=value」序列化。
+
+    動機：小模型（如 gemma-12b）讀寬 pipe-table 做「查某列某欄的值」會失敗（對不齊 row-key↔欄），
+    但逐列 `欄=值` 格式就讀得出來（已實測）。原表格保留（供整表呈現），額外附逐列（供查特定值）。
+    """
+    if not text or "|" not in text:
+        return text
+    lines = text.split("\n")
+    out: List[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        is_table_head = (
+            lines[i].count("|") >= 2
+            and i + 1 < n
+            and "-" in lines[i + 1]
+            and set(lines[i + 1].strip()) <= set("|-: ")
+            and lines[i + 1].count("|") >= 2
+        )
+        if is_table_head:
+            header = _split_md_row(lines[i])
+            j = i + 2
+            data = []
+            while j < n and lines[j].count("|") >= 2:
+                data.append(_split_md_row(lines[j]))
+                j += 1
+            out.append("\n".join(lines[i:j]))  # 原表格保留
+            rw = []
+            for k, row in enumerate(data, start=1):
+                pairs = [f"{h}={v}" for h, v in zip(header, row) if h.strip() and v.strip()]
+                if pairs:
+                    rw.append(f"第{k}列: " + "; ".join(pairs))
+            if rw:
+                out.append("（上表逐列）：\n" + "\n".join(rw))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 def _build_rag_messages(
     question: str,
     context_blocks: List[Dict[str, str]],
@@ -216,8 +307,12 @@ def _build_rag_messages(
     sys_msg = system_prompt if system_prompt is not None else DEFAULT_RAG_SYSTEM_PROMPT
     tmpl = user_template if user_template is not None else DEFAULT_RAG_USER_TEMPLATE
 
+    # 只對「最相關的前 N 個來源」做表格逐列增強：逐列序列化會讓含表格的塊大約加倍，
+    # 若每個來源都加會撐爆 num_ctx 導致生成退化（實測）。最相關的表格通常排在最前面。
+    _aug_top = getattr(settings, "RAG_TABLE_ROWWISE_TOP", 1)
     context_text = "\n\n".join(
-        f"[來源{block.get('source_num', idx + 1)}] {block.get('title') or '未命名段落'} ({_page_label(block, idx)})\n{(block.get('text') or '').strip()}"
+        f"[來源{block.get('source_num', idx + 1)}] {block.get('title') or '未命名段落'} ({_page_label(block, idx)})\n"
+        + (_augment_tables_rowwise((block.get('text') or '').strip()) if idx < _aug_top else (block.get('text') or '').strip())
         for idx, block in enumerate(context_blocks)
     )
 
@@ -256,7 +351,63 @@ def generate_rag_answer(
         return '查無足夠的相關內容，請提供更多文件或調整問題。'
 
     messages = _build_rag_messages(question, context_blocks, conversation_history, system_prompt, user_template)
-    return _chat_with_ollama(messages, think=True)
+    return _chat_with_provider(messages, think=True)
+
+
+_LOWCONF_TEMPLATE_TIPS = (
+    "建議調整查詢：\n"
+    "- 改用文件中的實際術語或數值（例如型號、規格編號、頻率值）\n"
+    "- 指定文件或分類以縮小範圍\n"
+    "- 換更具體的關鍵字，或把問題拆得更小\n"
+    "- 確認該資訊是否已上傳到系統"
+)
+
+
+def low_confidence_answer(
+    question: str,
+    context_blocks: List[Dict[str, Any]],
+) -> str:
+    """檢索信心偏低時的回應：不硬答，而是列出「最接近的內容」＋ LLM 動態產生的查詢修正建議。
+
+    建議由 LLM 依「問題＋最接近片段」生成（走 _chat_with_provider，雲地皆可）；失敗退回模板。
+    """
+    closest_lines: List[str] = []
+    for i, b in enumerate((context_blocks or [])[:3], start=1):
+        title = b.get("title") or "未命名段落"
+        page = b.get("page")
+        snip = re.sub(r"\s+", " ", (b.get("text") or "").strip())[:160]
+        loc = f" 第{page}頁" if page else ""
+        closest_lines.append(f"- [{i}] {title}{loc}：{snip}…")
+    closest = "\n".join(closest_lines) if closest_lines else "（資料庫中沒有可顯示的接近內容）"
+
+    tips: Optional[str] = None
+    if closest_lines:
+        try:
+            sys_msg = "你是文件問答助手。資料庫中沒有與使用者問題高度相關的內容。"
+            prompt = (
+                f"使用者問題：{question}\n\n"
+                f"資料庫中最接近的內容片段：\n{closest}\n\n"
+                "請用繁體中文簡短回覆：\n"
+                "1) 用一句話說明資料庫裡比較多的是什麼主題（依上面片段判斷）。\n"
+                "2) 給 2~3 條具體的查詢修正建議，幫使用者更可能找到想要的資訊"
+                "（例如改用哪些術語／數值、指定哪份文件或分類、換什麼關鍵字）。\n"
+                "不要杜撰片段中沒有的事實，也不要直接回答原問題本身。"
+            )
+            tips = _chat_with_provider(
+                [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}],
+                think=False,
+            )
+        except Exception as e:
+            logger.warning("low-confidence suggestion generation failed: %s", e)
+    if not (tips and tips.strip()):
+        tips = _LOWCONF_TEMPLATE_TIPS
+
+    return (
+        "⚠️ 資料庫中沒有找到與您問題「高度相關」的內容（檢索信心偏低）。"
+        "以下是最接近的片段，但可能不直接相關：\n\n"
+        f"{closest}\n\n"
+        f"{tips.strip()}"
+    )
 
 
 def generate_rag_answer_stream(
@@ -272,32 +423,41 @@ def generate_rag_answer_stream(
         return
 
     messages = _build_rag_messages(question, context_blocks, conversation_history, system_prompt, user_template)
-    client = get_client()
-    for chunk in client.chat_stream(messages, model=settings.OLLAMA_LLM_MODEL, think=True):
-        yield chunk
+    from .llm_provider import get_llm_provider
+    provider = get_llm_provider()
+    if getattr(provider, "name", "ollama") == "ollama":
+        client = get_client()
+        for chunk in client.chat_stream(messages, model=settings.OLLAMA_LLM_MODEL, think=True):
+            yield chunk
+    else:
+        for chunk in provider.chat_stream(messages):
+            yield chunk
 
 
 _EMBED_MAX_CHARS = 7000  # qwen3-embedding:8b supports 8192 tokens (~7000 English chars)
 _EMBED_BATCH_SIZE = 10   # process N chunks per request to avoid timeout
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
+    """經 embedding provider 抽象產生向量，受 EMBEDDING_PROVIDER 設定支配。
+
+    預設 ollama（行為與舊版一致，用 OLLAMA_EMBED_MODEL）。注意：切換 embedding 後端
+    （例如 gemini）會改變向量維度，與既有 FAISS 索引不相容，需重新向量化所有文件。
+    """
     if not texts:
         return []
 
-    client = get_client()
+    from .llm_provider import get_embedding_provider
+
+    provider = get_embedding_provider()
     truncated = [t[:_EMBED_MAX_CHARS] for t in texts]
 
     all_embeddings: List[List[float]] = []
     for i in range(0, len(truncated), _EMBED_BATCH_SIZE):
         batch = truncated[i:i + _EMBED_BATCH_SIZE]
-        batch_embeddings = client.embed(
-            batch,
-            model=settings.OLLAMA_EMBED_MODEL,
-        )
-        all_embeddings.extend(batch_embeddings)
+        all_embeddings.extend(provider.embed(batch))
 
     if len(all_embeddings) != len(texts):
-        raise RuntimeError("Ollama 回傳的 embedding 數量與輸入不符")
+        raise RuntimeError("embedding 數量與輸入不符")
     return all_embeddings
 
 
@@ -347,7 +507,7 @@ Examples:
 Return JSON strictly following the schema.
 """
 
-    raw = _chat_with_ollama(
+    raw = _chat_with_provider(
         [{"role": "user", "content": prompt}],
         response_format=FOLLOWUP_INTENT_SCHEMA,
     )
@@ -372,7 +532,7 @@ def generate_suggested_questions(context: str, answered_question: str) -> List[s
 請只回傳 JSON 陣列格式，如：
 ["問題 1","問題 2","問題 3"]
 """
-    raw = _chat_with_ollama(
+    raw = _chat_with_provider(
         [{"role": "user", "content": prompt}],
         response_format=SUGGESTED_QUESTION_SCHEMA,
     )
@@ -389,7 +549,7 @@ def generate_fallback_answer(question: str) -> str:
 
 問題：{question}
 """
-    return _chat_with_ollama([
+    return _chat_with_provider([
         {"role": "system", "content": "請以繁體中文（台灣）作答，嚴格禁止簡體中文。避免輸出控制標記或思考過程。"},
         {"role": "user", "content": prompt},
     ])
@@ -422,17 +582,24 @@ def extract_text_with_vision(
         return buf.getvalue()
 
     prompt = (
-        "You are a document digitization assistant. Process this PDF page and output two things IN ORDER:\n\n"
-        "1. IMAGES & DIAGRAMS: For every image, chart, diagram, or figure on the page, write a description inside [IMAGE: ...]. "
-        "Describe what it shows, key elements, labels, arrows, and any text embedded in it. "
-        "Example: [IMAGE: Flowchart showing 3 steps: Input → Process → Output. Step labels in Chinese read '資料輸入', '模型運算', '結果輸出'.]\n\n"
-        "2. TEXT CONTENT: Extract ALL visible text on the page, preserving structure:\n"
-        "   - Keep indentation and hierarchy for lists and sub-items.\n"
-        "   - For tables, preserve row/column relationships. Example:\n"
-        "     項目 | 條件A | 條件B\n"
-        "     數值 | 100   | 200\n"
-        "   - Include ALL text, including captions, labels, footnotes, and headers.\n\n"
-        "Do NOT skip images. Do NOT add commentary outside of the above format."
+        "You are a document digitization assistant. Convert this PDF page into clean GitHub-Flavored Markdown.\n\n"
+        "STRICT OUTPUT RULES — output only Markdown, nothing else:\n\n"
+        "1. HEADINGS — Use `##` for section titles, `###` for sub-sections. Preserve hierarchy as it appears on the page.\n\n"
+        "2. TABLES — MUST use Markdown pipe-table syntax INCLUDING the separator row. Example:\n"
+        "```\n"
+        "| 項目 | 條件A | 條件B |\n"
+        "| --- | --- | --- |\n"
+        "| 數值 | 100 | 200 |\n"
+        "```\n"
+        "   Preserve column count exactly. Empty cells use a space. NEVER flatten tables into prose.\n\n"
+        "3. LISTS — Use `-` for bullets and `1.` `2.` for numbered lists. Indent sub-items with 2 spaces.\n\n"
+        "4. IMAGES & DIAGRAMS — For every image, chart, diagram, flowchart, or figure on the page, insert a description block in this exact form:\n"
+        "   `[IMAGE: <one-paragraph description: what it shows, key elements, labels, arrows, embedded text>]`\n"
+        "   Place the [IMAGE: ...] block where the figure appears in reading order.\n"
+        "   NEVER skip an image. Even a small logo or icon gets a brief [IMAGE: ...] line.\n\n"
+        "5. INLINE FORMATTING — Use `**bold**` for emphasized labels, backticks for codes/IDs (e.g. `MIL-STD-810G`).\n\n"
+        "6. INCLUDE EVERYTHING — All visible text: body, captions, labels, footnotes, headers, page numbers, footers. Preserve original language (do not translate Chinese to English or vice versa).\n\n"
+        "7. NO COMMENTARY — Do NOT preface with 'Here is the markdown' or wrap your output in code fences. Output the Markdown content directly."
     )
 
     for img_bytes, page_num in zip(image_bytes_list, page_numbers):
@@ -627,7 +794,7 @@ def finalize_text_answer(notes: str, question: Optional[str] = None) -> str:
         {"role": "system", "content": system},
         {"role": "user", "content": task},
     ]
-    return _chat_with_ollama(messages, model=settings.OLLAMA_LLM_MODEL)
+    return _chat_with_provider(messages)
 
 def analyze_pdf_page_images(
     image_bytes_list: List[bytes],

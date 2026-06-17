@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { Button, Divider, Input, List, Modal, Select, Space, Tag, Typography, message } from "antd";
+import { useEffect, useState } from "react";
+import { Button, Divider, Input, List, Modal, Select, Space, Tag, Typography } from "antd";
 import { EditOutlined } from "@ant-design/icons";
 
 const { Paragraph, Text, Title } = Typography;

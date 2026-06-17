@@ -1,5 +1,4 @@
-﻿import React from "react";
-import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-dom";
+﻿import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-dom";
 import { ConfigProvider, App as AntdApp } from "antd";
 import zhTW from "antd/locale/zh_TW";
 
@@ -14,6 +13,7 @@ import AdminPage from "./pages/AdminPage";
 import VectorSearchTestPage from "./pages/VectorSearchTestPage";
 import VectorHealthPage from "./pages/VectorHealthPage";
 import NotebookPage from "./pages/NotebookPage";
+import KnowledgeGraphPage from "./pages/KnowledgeGraphPage";
 import PrivateRoute from "./components/PrivateRoute";
 import { TaskStatusProvider } from "./contexts/TaskStatusContext";
 import TaskProgressBanner from "./components/TaskProgressBanner";
@@ -75,6 +75,14 @@ function App() {
               element={(
                 <PrivateRoute>
                   <NotebookPage />
+                </PrivateRoute>
+              )}
+            />
+            <Route
+              path="/knowledge-graph"
+              element={(
+                <PrivateRoute>
+                  <KnowledgeGraphPage />
                 </PrivateRoute>
               )}
             />

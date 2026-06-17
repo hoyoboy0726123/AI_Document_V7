@@ -21,6 +21,32 @@ def _cell_text(cell) -> str:
     return str(cell).replace("\n", " ").strip() if cell else ""
 
 
+# 段落軟上限：超過就沿句子邊界切成多個 segment（不截斷、不遺失內容）。
+# 取代舊的「>1000 字直接截斷加 ...」做法，避免規範條文/表格說明後半段消失。
+_PARAGRAPH_SOFT_LIMIT = 1500
+# 句子邊界：中文標點 。！？； 與英文 .!?; 以及換行
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；!?;\.\n])\s*")
+
+
+def _split_long_paragraph(text: str, soft_limit: int = _PARAGRAPH_SOFT_LIMIT) -> List[str]:
+    """將過長段落沿句子邊界切成 <= soft_limit 的片段；短段落原樣回傳。"""
+    if len(text) <= soft_limit:
+        return [text]
+    pieces: List[str] = []
+    buf = ""
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        if not sentence:
+            continue
+        if buf and len(buf) + len(sentence) > soft_limit:
+            pieces.append(buf)
+            buf = sentence
+        else:
+            buf += sentence
+    if buf:
+        pieces.append(buf)
+    return pieces or [text]
+
+
 def _is_mostly_empty(table_data: List[List], threshold: float = _EMPTY_CELL_THRESHOLD) -> bool:
     cells = [cell for row in table_data for cell in row]
     if not cells:
@@ -117,11 +143,11 @@ def extract_text_and_segments(pdf_bytes: bytes) -> Tuple[str, List[schemas.Docum
 
                 for idx, paragraph in enumerate(paragraphs, start=1):
                     normalized = re.sub(r"[ \t]+", " ", paragraph)
-                    if len(normalized) > 1000:
-                        normalized = f"{normalized[:1000]}..."
-                    segments.append(
-                        schemas.DocumentSegment(page=page_number, paragraph_index=idx, text=normalized)
-                    )
+                    # 不再截斷；過長段落沿句子邊界切成多個 segment，內容完整保留。
+                    for piece in _split_long_paragraph(normalized):
+                        segments.append(
+                            schemas.DocumentSegment(page=page_number, paragraph_index=idx, text=piece)
+                        )
 
         combined_text = "\n\n".join(sections).strip()
         if combined_text:

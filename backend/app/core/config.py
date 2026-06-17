@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -62,7 +62,100 @@ class Settings(BaseSettings):
     # PDF 多頁 VL 分析上限（受模型 context window 限制）
     MAX_PDF_ANALYSIS_PAGES: int = 10
 
+    # LLM provider 抽象：可獨立切換 LLM 與 embedding 的後端
+    LLM_PROVIDER: str = "ollama"               # ollama | gemini
+    LLM_MODEL: str | None = None               # 覆寫 OLLAMA_LLM_MODEL；空則用 provider 預設
+    EMBEDDING_PROVIDER: str = "ollama"
+    EMBEDDING_MODEL: str | None = None
+    # VL 視覺模型(目前只支援 ollama;Gemini vision 走 LLM_PROVIDER 那條)
+    VISION_PROVIDER: str = "ollama"
+    VISION_MODEL: str | None = None            # 覆寫 OLLAMA_VISION_MODEL;留空則沿用
 
+    # Gemini / Google AI Studio
+    GEMINI_API_KEY: str | None = None
+    GEMINI_LLM_MODEL: str = "gemini-2.5-flash"
+    GEMINI_EMBED_MODEL: str = "text-embedding-004"
+
+    # KG 抽取
+    KG_AUTO_EXTRACT: bool = True               # 文件 ingest 完成後自動跑 KG 抽取
+    KG_MIN_CONFIDENCE: float = 0.3             # 低於此值的 LLM relation 不寫入
+
+    # RAG「小找大」：命中小塊後，連同同文件前後 N 塊一起餵給 LLM，
+    # 避免句子被切塊邊界截斷（搜尋精度用小塊、上下文完整性用擴展後的大塊）。
+    RAG_NEIGHBOR_RADIUS: int = 1               # 0 = 關閉擴展；1 = 帶 k-1/k+1
+    RAG_EXPAND_MAX_CHARS: int = 2000           # 單一來源擴展後的字數上限
+    # 所有來源餵入 LLM 的總字數「上限」(實際還會依 num_ctx 動態夾限，見 effective_rag_budget)。
+    # input+output 共用同一 context window，須留生成空間。8192 視窗下 6000 字安全。
+    RAG_CONTEXT_BUDGET_CHARS: int = 6000
+    RAG_OUTPUT_RESERVE_CHARS: int = 3000       # 預留給「生成」的視窗額度（夾限時扣除）；調高以容納多來源長答案
+
+    # OCR(PP-StructureV3)頁面影像大小。paddle CPU 在「大尺寸影像」上跑 layout/table 模型會
+    # native segfault(實測 2200px 的頁面會整個 crash、1600px 正常)。把頁面影像上限壓到安全值。
+    OCR_DPI: int = 150
+    OCR_MAX_DIMENSION: int = 1600
+    # 子進程隔離:每頁在 worker 子進程跑 PP-Structure,某頁 native segfault 不拖垮整份(崩潰頁退回 basic OCR)。
+    OCR_SUBPROCESS_ISOLATION: bool = True
+    OCR_WORKER_TIMEOUT: int = 3600              # 單次 worker 子進程逾時(秒)
+
+    # OCR 引擎選擇(可在 admin 切換)。
+    #  rapid        = 輕量 onnx 三件套(RapidLayout+RapidTable+RapidOCR);快(~4s/頁)、無 paddle/segfault。
+    #  pp_structure = PaddleOCR PP-StructureV3(重、有 segfault 風險,保底用)。
+    OCR_ENGINE: str = "rapid"                   # rapid | pp_structure
+    # rapid 後端的 OCR 模型等級/版本/裝置：
+    #  mobile + PP-OCRv4 ~4s/頁、結構乾淨(預設)；server + PP-OCRv5 近乎完美但 CPU ~87s/頁(GPU 才實用)。
+    OCR_MODEL_TIER: str = "mobile"              # mobile | server
+    OCR_VERSION: str = "PP-OCRv4"               # PP-OCRv4 | PP-OCRv5
+    OCR_DEVICE: str = "cpu"                     # cpu | gpu(需 onnxruntime-gpu;正式機 5090 用)
+
+    # 混合檢索（向量 + BM25 關鍵字，用 RRF 融合）。對「靠關鍵字才找得到的分散子項目」recall 大幅提升。
+    # 僅 SQLite 生效（FTS5 trigram）；非 SQLite 自動退回純向量。
+    # 表格逐列增強：只對最相關的前 N 個來源把表格序列化成「逐列 key=value」(幫小模型查 cell)；
+    # 全部都加會讓 context 加倍而撐爆 num_ctx → 生成退化，故預設只增強最前面 1 個。
+    RAG_TABLE_ROWWISE_TOP: int = 1
+    RAG_HYBRID_SEARCH: bool = True
+    RAG_RRF_K: int = 60                         # RRF 常數，越大越平滑（標準值 60）
+    # 融合後餵進 LLM 的「context 塊數」上限。hybrid recall 高但塊一多就破碎，
+    # 過多分散塊會讓生成退化；超出的命中仍會列在 sources（前端可預覽），只是不進 LLM context。
+    RAG_MAX_CONTEXT_CHUNKS: int = 6
+
+    # 撈寬再精選（rerank）：對融合後的候選池，用一次便宜 LLM 打分，把「真正含規格/判定/程序」
+    # 的乾淨段落排到前面、把修訂紀錄/續頁/目錄等垃圾踢掉，再餵生成。失敗自動退回原順序。
+    RAG_RERANK: bool = True
+    RAG_RERANK_POOL: int = 12                   # 送進 rerank 的候選數（撈寬）
+    RAG_RERANK_MIN_SCORE: int = 3               # LLM 後端：低於此分（0-10）視為不相關，剔除
+    # rerank 後端：cross_encoder（專門模型，CPU，~1-3s，建議）／ llm（用 gemma 打分，慢 ~100s）。
+    # cross_encoder 載入失敗會自動退回 llm。
+    RAG_RERANK_BACKEND: str = "cross_encoder"
+    RAG_RERANK_MODEL: str = "BAAI/bge-reranker-base"  # 多語(含中英)cross-encoder，CPU 可跑
+
+    # 低信心 fallback：以「最相關段落的 cross-encoder 分數」當信心訊號。實測相關題 top 分數
+    # ≥0.4(離題 ≈0.00），故門檻設 0.15 可乾淨分開。低於此值時不硬答，改回「最接近的內容
+    # ＋ LLM 動態產生的查詢修正建議」。CE 不可用時此 gate 自動略過（不退化）。
+    RAG_LOWCONF_CE_THRESHOLD: float = 0.15
+    RAG_RERANK_CE_MIN_SCORE: float = 0.0        # cross-encoder 分數門檻（logit，>0 偏相關）
+
+
+
+    @field_validator("OLLAMA_KEEP_ALIVE", mode="before")
+    @classmethod
+    def _normalize_keep_alive(cls, v):
+        # Ollama daemon 接受純數字（"-1" = 永久），但 Ollama API 要求帶單位（如 "5m"）。
+        # 系統環境常為 daemon 設 OLLAMA_KEEP_ALIVE=-1，會被 pydantic-settings 一起讀進來。
+        # 這裡若拿到純數字 / 負數，補上秒單位避免送 API 時 400。
+        if v is None:
+            return v
+        s = str(v).strip()
+        if not s:
+            return s
+        # 已帶單位（s/m/h）就直接用
+        if s[-1].lower() in {"s", "m", "h"}:
+            return s
+        # 純數字（含負號）→ 補 's'
+        try:
+            int(s)
+            return f"{s}s"
+        except ValueError:
+            return s
 
     class Config:
         env_file = ".env"
