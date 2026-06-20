@@ -52,12 +52,22 @@ method's own `504.3/1 SCOPE`.
 `agent_tools.section_lookup(name)` resolves a METHOD/section by name or number
 ("Method 510.7", "510.7"), pulls its whole scope-keyed sub-tree (`doc:ID#510.7` +
 `doc:ID#510.7/%`) and returns `referenced_standards` (+ `by_section`). The agent system
-prompt routes "what standards does Method/§X reference" to it. Because grounded synthesis
-(gemma4) tends to under-weight the KG block, `agent.run_agent` also **deterministically
-appends** the authoritative `referenced_standards` list to the final answer. Verified:
-*"Method 510.7 引用了哪些外部規範?"* → answer ends with `ASTM D185-07、IEC 60068-2-68、
-MIL-HDBK-310、MIL-STD-210B、MIL-STD-3033、MIL-STD-810` (vs the old vague "no external
-standards" answer before the feature).
+prompt routes "what standards does Method/§X reference" to it.
+
+On a section-reference hit, `agent.run_agent` returns a **superset answer = KG + RAG**
+(Agent mode is meant to replace RAG mode, so it must contain everything RAG would give
+plus the KG enrichment):
+  1. **KG block** — deterministic, authoritative: each external standard with the sections
+     that cite it (built from `by_section`, NOT from gemma4 synthesis — synthesis
+     under-weights the KG block and would otherwise answer ~identically to pure RAG).
+  2. **`補充（文件內容檢索）` block** — the normal grounded RAG synthesis (internal
+     sections, sequencing, procedural context).
+
+Verified: *"Method 510.7 引用了哪些外部規範?"* → **6 external standards** (ASTM D185-07,
+IEC 60068-2-68, MIL-HDBK-310, MIL-STD-210B, MIL-STD-3033, MIL-STD-810) each with citing
+sections, PLUS the RAG internal/procedural context. Pure `/rag/query` on the same question
+returns **0 external standards** (only internal sections) — confirming the Agent answer is
+a strict superset, not RAG-equivalent.
 
 ## Still TODO (follow-ups, not blockers)
 
