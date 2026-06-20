@@ -668,9 +668,9 @@ def run_agent(
         yield {"type": "final", "text": body, "sources": enum_sources}
         return
 
-    # 確定性優先：section_lookup 命中 → 直接用知識圖譜的權威引用清單作答，不經 grounded 合成。
-    # 理由：合成（gemma4）會偏向 RAG 片段，對「X 引用了哪些規範」答出跟純 RAG 幾乎一樣的內部章節，
-    # 等於沒用到 KG。KG 既然有結構化的 method/section→standard 邊，就以它為主、答得比 RAG 多。
+    # KG ⊇ RAG：section_lookup 命中 → 答案 = 知識圖譜的權威外部規範清單（結構化、純 RAG 給不了）
+    #          ＋ RAG 合成的內容（內部章節/程序性引用等）。Agent 模式作為 RAG 的超集，故兩者都納入。
+    # KG 段以確定性方式產出（不靠 gemma4 合成，否則會被 RAG 片段蓋過而漏掉外部規範）。
     if section_lookup_obs and section_lookup_obs.get("referenced_standards"):
         nm = section_lookup_obs.get("name") or section_lookup_obs.get("matched")
         cite: Dict[str, set] = {}
@@ -688,10 +688,21 @@ def run_agent(
             for s in stds:
                 secs = "、".join(sorted(cite[s])[:4])
                 out.append(f"- **{s}**" + (f"（見 {secs}）" if secs else ""))
-            src = [{"document_id": ev.get("document_id"), "title": ev.get("title"),
-                    "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
-                   for ev in seeded[:3]]
-            yield {"type": "final", "text": "\n".join(out), "sources": src}
+            kg_block = "\n".join(out)
+            # 再加上 RAG 合成（文件內容檢索：內部章節、程序性引用、背景）
+            rag_part, rag_sources = None, []
+            try:
+                g, rag_sources, _n, _t = _grounded_synthesis(db, question, rag_evidence, kg_notes, conversation_history)
+                if g and g.strip():
+                    rag_part = g.strip()
+            except Exception as e:
+                logger.warning("section_lookup combined synthesis failed: %s", e)
+            body = kg_block if not rag_part else f"{kg_block}\n\n── 補充（文件內容檢索）──\n{rag_part}"
+            src = rag_sources or [
+                {"document_id": ev.get("document_id"), "title": ev.get("title"),
+                 "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
+                for ev in seeded[:3]]
+            yield {"type": "final", "text": body, "sources": src}
             return
 
     # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。
