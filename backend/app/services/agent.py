@@ -52,6 +52,11 @@ must answer the ORIGINAL question's subject.
 - For "what standards/specs does METHOD or section X reference/cite" ("方法/§X 引用了哪些規範/標準"), \
 call section_lookup(name) — test methods and numbered sections are graph nodes with an EXACT \
 reference list (rag_search is vague and misses the reference table). e.g. section_lookup("Method 510.7").
+- When the user asks ABOUT a specific standard by its id ("IEC 60068-2-68 是什麼", "what is ASTM D185-07"), \
+call spec_lookup with that EXACT id FIRST to resolve the right node (do NOT let rag_search confuse it with a \
+similarly-numbered standard, e.g. IEC 60068-2-68 vs IEC 68-2-52). The corpus contains the referenced \
+standard's TITLE (from this document's reference list) but usually NOT its full text — give the title/scope \
+if found and state plainly that the standard's full content is not in the knowledge base; do NOT fabricate it.
 - For enumeration / listing questions ("what items/tests does X have", "有哪些", "list all", \
 "子項目", "sub-tests of X"), call list_subitems(name) FIRST. It returns the COMPLETE set from \
 the knowledge graph; rag_search alone retrieves only top-k chunks and WILL miss items.
