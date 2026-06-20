@@ -32,48 +32,38 @@ Ran `section_graph_poc.py` on slices of MIL-STD-810H:
 - **Table page (Part One Annex A questionnaire):** 0 false sections (28 bold table cells dropped).
 - **TOC pages:** skipped.
 
-## Integration (apply in `kg_pipeline.extract_kg_from_document`, then re-run KG extract)
+## Integration — DONE (wired in `kg_pipeline.extract_kg_from_document`)
 
-The downstream node/edge code already exists; only the **source of sections** changes. Replace
-the `kg_structure.extract_structure(chunks)` call (regex-on-flattened-text, found ~1 section in
-1089 pages) with the PDF-derived map. Re-reads the document's stored PDF; **no schema change,
-no re-ingest** — re-runnable on already-ingested docs via `POST /api/v1/kg/extract/{id}`:
+The structural pass now builds Section nodes from `kg_headings.build_section_spec_map(pdf)` when
+`settings.KG_HEADING_SECTIONS` (default **True**) and `document.pdf_path` exists; it falls back to
+the old `kg_structure` regex otherwise. **No schema change, no re-ingest** — re-runnable on
+already-ingested docs via `POST /api/v1/kg/extract/{id}`. Section canonical_ids are scope-keyed
+(`doc:{id}#{h.key}`) so annex-local numbering doesn't collide.
 
-```python
-# in extract_kg_from_document(), where sections are currently built:
-import os
-from . import kg_headings
-section_specs = {}
-sections = []
-if getattr(settings, "KG_HEADING_SECTIONS", True) and document.pdf_path and os.path.exists(document.pdf_path):
-    with open(document.pdf_path, "rb") as f:
-        headings, section_specs, doc_level_specs = kg_headings.build_section_spec_map(f.read())
-    sections = [h for h in headings if h.number != "-"]
-# then, for each h in sections:
-#   sec = kg_service.upsert_entity(db, canonical_id=f"{doc_canon}#{h.number}",
-#            type_=h.kind, name=h.title, meta={"number": h.number, "page": h.page, "document_id": document.id})
-#   Document --contains--> sec        (if h.parent is None)
-#   sec --part_of--> doc_canon#{h.parent}   (if h.parent set; method/annex parent is the method number)
-#   for spec in section_specs.get(h.number, ()): sec --references--> spec_entity
-# keep the existing Document--references-->doc_level_specs fallback.
-```
+**Verified on the live 1089-page MIL-STD-810H** (`POST /kg/extract/{id}`): the KG went from 1
+section to **30 method / 1930 section / 36 annex nodes, 1941 part_of + 830 section→Standard
+reference edges**. Spot-checks: `#510.7` and `#504.3` are method nodes with their 1..6 subtree;
+`#504.3/2.2.2` (Contaminant Fluid Groups) `--references--> ASTM B117/D1141/D4814/D975/MIL-PRF-…`;
+`#504.3-A` (ANNEX A) children are `504.3-A/1 GASOLINE FUELS…`, correctly **not** colliding with the
+method's own `504.3/1 SCOPE`.
 
-Also extend the Agent so method/section nodes are reachable: in `agent_tools`, have
-`spec_lookup` / a new `section_lookup` resolve `doc:{id}#{number}` and `METHOD n`, and let
-`spec_references` traverse section→standard edges.
+## Still TODO (follow-ups, not blockers)
 
-## Remaining refinements (not blockers)
+1. **Agent reachability.** Extend `agent_tools` so method/section nodes are queryable: have
+   `spec_lookup` / a new `section_lookup` resolve `doc:{id}#{number}` and "METHOD n", and let
+   `spec_references` traverse section→Standard edges. Until then the nodes exist + are visible in
+   the `/knowledge-graph` page but the ReAct agent can't look a method up by name.
+2. **Spec attribution is line-level** within the document walk (current section = last heading
+   seen). Good for reference lists/tables; revisit only if cross-section bleed appears.
+3. **Unnumbered headings** (e.g. "INTRODUCTION") are intentionally not emitted (avoids WARNING/
+   table-label noise). If a target doc relies on them, add a stricter unnumbered rule or use the
+   OCR layout model's `paragraph_title` regions.
 
-1. **Annex child-section namespacing.** An annex restarts numbering ("1. GASOLINE FUELS" under
-   ANNEX A) which collides with the method's own "1. SCOPE" (both `doc:X#1`). Track "inside annex
-   X" during the walk and prefix child sections (e.g. `504.3-A#1`). PoC currently leaves annex
-   children at top level.
-2. **Spec attribution is line-level within a page** — good for reference lists/tables, but a spec
-   mentioned in prose far from its governing heading attaches to the current section, which is the
-   intended behaviour. Revisit only if cross-section bleed shows up.
-3. **Unnumbered headings** (e.g. "INTRODUCTION") are intentionally not emitted (avoids WARNING
-   noise). If a target doc relies on them, add a stricter unnumbered-title rule or use the OCR
-   layout model's `paragraph_title` regions.
+## Performance
+
+Heading extraction uses **PyMuPDF (fitz)**: full 1089-page scan ≈ **10s** (an earlier pdfplumber
+implementation took ~14 min). The KG structural pass is therefore ~10s; the slow part of a full
+KG re-extract remains the LLM spec↔spec relation classification (unchanged).
 
 ## Generality
 
