@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # KG 抽取
     KG_AUTO_EXTRACT: bool = True               # 文件 ingest 完成後自動跑 KG 抽取
     KG_MIN_CONFIDENCE: float = 0.3             # 低於此值的 LLM relation 不寫入
+    # 用版面/字體式標題偵測（kg_headings）建立 method/section 節點與引用邊；
+    # 關閉則退回 kg_structure 的純文字 regex 偵測。需重讀文件 PDF（document.pdf_path）。
+    KG_HEADING_SECTIONS: bool = True
 
     # RAG「小找大」：命中小塊後，連同同文件前後 N 塊一起餵給 LLM，
     # 避免句子被切塊邊界截斷（搜尋精度用小塊、上下文完整性用擴展後的大塊）。

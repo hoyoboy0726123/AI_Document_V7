@@ -127,7 +127,7 @@ def extract_kg_from_document(db: Session, document: models.Document, task: Optio
 
     # ── Structural pass (deterministic, NO LLM): 通用 schema 的 Document / Section
     #    + contains / part_of / references。doc-type 無關，領域差異走 meta.kind。
-    from . import kg_structure
+    import os as _os
 
     structural_edges = 0
     doc_canon = f"doc:{document.id}"
@@ -135,29 +135,76 @@ def extract_kg_from_document(db: Session, document: models.Document, task: Optio
         db, canonical_id=doc_canon, type_="document",
         name=document.title or doc_canon, meta={"document_id": document.id},
     )
-    sections, doc_level_specs = kg_structure.extract_structure(chunks)
+
+    use_headings = (
+        bool(getattr(settings, "KG_HEADING_SECTIONS", True))
+        and document.pdf_path and _os.path.exists(document.pdf_path)
+    )
     section_ent: dict = {}
-    for number, sec in sections.items():
-        ent = kg_service.upsert_entity(
-            db, canonical_id=f"{doc_canon}#{number}", type_="section", name=sec.title,
-            meta={"kind": sec.kind, "number": number, "page": sec.page, "document_id": document.id},
-        )
-        section_ent[number] = ent
-        if kg_service.upsert_relation(db, src_id=doc_ent.id, dst_id=ent.id, rel_type="contains",
-                                      document_id=document.id, confidence=1.0):
-            structural_edges += 1
-    for number, ent in section_ent.items():
-        parent = kg_structure._parent_number(number)
-        if parent and parent in section_ent:
-            if kg_service.upsert_relation(db, src_id=ent.id, dst_id=section_ent[parent].id,
-                                          rel_type="part_of", document_id=document.id, confidence=1.0):
+    doc_level_specs: set = set()
+    if use_headings:
+        # 版面/字體式標題偵測（kg_headings）：method/section 變成節點，
+        # 章節編號帶 scope key（annex 子章節不撞主方法號），引用邊由行級歸屬而來。
+        from . import kg_headings
+        try:
+            with open(document.pdf_path, "rb") as _f:
+                headings, section_specs, doc_level_specs = kg_headings.build_section_spec_map(_f.read())
+        except Exception as exc:
+            logger.warning("kg_headings failed for %s, falling back to kg_structure: %s", document.id, exc)
+            headings, section_specs = [], {}
+            use_headings = False
+        for h in headings:
+            ent = kg_service.upsert_entity(
+                db, canonical_id=f"{doc_canon}#{h.key}", type_=h.kind, name=h.title,
+                meta={"kind": h.kind, "number": h.number, "page": h.page, "document_id": document.id},
+            )
+            section_ent[h.key] = ent
+        for h in headings:
+            ent = section_ent[h.key]
+            if h.parent and h.parent in section_ent:
+                rel_ok = kg_service.upsert_relation(db, src_id=ent.id, dst_id=section_ent[h.parent].id,
+                                                    rel_type="part_of", document_id=document.id, confidence=1.0)
+            else:
+                rel_ok = kg_service.upsert_relation(db, src_id=doc_ent.id, dst_id=ent.id,
+                                                    rel_type="contains", document_id=document.id, confidence=1.0)
+            if rel_ok:
                 structural_edges += 1
-    for number, sec in sections.items():
-        for sp in sec.specs:
-            sp_ent = canonical_to_entity.get(sp)
-            if sp_ent and kg_service.upsert_relation(db, src_id=section_ent[number].id, dst_id=sp_ent.id,
-                                                     rel_type="references", document_id=document.id, confidence=1.0):
+        for key, specs in section_specs.items():
+            sent = section_ent.get(key)
+            if not sent:
+                continue
+            for sp in specs:
+                sp_ent = canonical_to_entity.get(sp)
+                if sp_ent and kg_service.upsert_relation(db, src_id=sent.id, dst_id=sp_ent.id,
+                                                         rel_type="references", document_id=document.id, confidence=1.0):
+                    structural_edges += 1
+
+    if not use_headings:
+        # Fallback：純文字 regex 結構偵測（無 PDF 或關閉旗標時）。
+        from . import kg_structure
+        sections, doc_level_specs = kg_structure.extract_structure(chunks)
+        for number, sec in sections.items():
+            ent = kg_service.upsert_entity(
+                db, canonical_id=f"{doc_canon}#{number}", type_="section", name=sec.title,
+                meta={"kind": sec.kind, "number": number, "page": sec.page, "document_id": document.id},
+            )
+            section_ent[number] = ent
+            if kg_service.upsert_relation(db, src_id=doc_ent.id, dst_id=ent.id, rel_type="contains",
+                                          document_id=document.id, confidence=1.0):
                 structural_edges += 1
+        for number, ent in section_ent.items():
+            parent = kg_structure._parent_number(number)
+            if parent and parent in section_ent:
+                if kg_service.upsert_relation(db, src_id=ent.id, dst_id=section_ent[parent].id,
+                                              rel_type="part_of", document_id=document.id, confidence=1.0):
+                    structural_edges += 1
+        for number, sec in sections.items():
+            for sp in sec.specs:
+                sp_ent = canonical_to_entity.get(sp)
+                if sp_ent and kg_service.upsert_relation(db, src_id=section_ent[number].id, dst_id=sp_ent.id,
+                                                         rel_type="references", document_id=document.id, confidence=1.0):
+                    structural_edges += 1
+
     for sp in doc_level_specs:
         sp_ent = canonical_to_entity.get(sp)
         if sp_ent and kg_service.upsert_relation(db, src_id=doc_ent.id, dst_id=sp_ent.id,
