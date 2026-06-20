@@ -668,6 +668,32 @@ def run_agent(
         yield {"type": "final", "text": body, "sources": enum_sources}
         return
 
+    # 確定性優先：section_lookup 命中 → 直接用知識圖譜的權威引用清單作答，不經 grounded 合成。
+    # 理由：合成（gemma4）會偏向 RAG 片段，對「X 引用了哪些規範」答出跟純 RAG 幾乎一樣的內部章節，
+    # 等於沒用到 KG。KG 既然有結構化的 method/section→standard 邊，就以它為主、答得比 RAG 多。
+    if section_lookup_obs and section_lookup_obs.get("referenced_standards"):
+        nm = section_lookup_obs.get("name") or section_lookup_obs.get("matched")
+        cite: Dict[str, set] = {}
+        for item in (section_lookup_obs.get("by_section") or []):
+            std = str(item.get("references") or "")
+            sec = str(item.get("section") or "").strip()
+            if not std or std.startswith("doc:") or std == "MIL-STD-810H":
+                continue
+            cite.setdefault(std, set())
+            if sec:
+                cite[std].add(sec)
+        stds = sorted(cite.keys())
+        if stds:
+            out = [f"**{nm}** 全章節引用的外部規範，共 {len(stds)} 項（依知識圖譜的章節引用結構，非向量檢索）：", ""]
+            for s in stds:
+                secs = "、".join(sorted(cite[s])[:4])
+                out.append(f"- **{s}**" + (f"（見 {secs}）" if secs else ""))
+            src = [{"document_id": ev.get("document_id"), "title": ev.get("title"),
+                    "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
+                   for ev in seeded[:3]]
+            yield {"type": "final", "text": "\n".join(out), "sources": src}
+            return
+
     # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。
     final_sources: List[Dict[str, Any]] = []
 
@@ -729,17 +755,6 @@ def run_agent(
                               "page": ev.get("page"), "snippet": ev.get("snippet"),
                               "score": ev.get("score")} for ev in seeded[:5]]
     # else：有證據但合成不出 → 保留 ReAct 迴圈自己的 final_text。
-
-    # 確定性附加：section_lookup 的權威引用清單（grounded 合成常偏好 RAG 片段而漏掉此清單，
-    # 故直接從知識圖譜的結構化結果補上，保證 method/section 的外部規範清單一定出現在答案中）。
-    if section_lookup_obs and section_lookup_obs.get("referenced_standards"):
-        std = [s for s in section_lookup_obs["referenced_standards"]
-               if not str(s).startswith("doc:") and str(s) not in ("MIL-STD-810H",)]
-        if std:
-            name = section_lookup_obs.get("name") or section_lookup_obs.get("matched")
-            block = (f"\n\n---\n📋 知識圖譜：**{name}** 全章節引用的外部規範（共 {len(std)} 項）：\n"
-                     + "、".join(std))
-            if block.strip() not in (final_text or ""):
-                final_text = (final_text or "").rstrip() + block
+    # （section_lookup 命中時已在上方以確定性優先作答並 return，這裡不再附加。）
 
     yield {"type": "final", "text": final_text, "sources": final_sources}
