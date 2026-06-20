@@ -19,7 +19,8 @@ Each heading carries a SCOPED key so numbering that restarts inside an annex
   section 2.2.5.1 in 504.3 -> key "504.3/2.2.5.1"      parent "504.3/2.2.5"
   section 1 inside ANNEX A -> key "504.3-A/1"          parent "504.3-A"
 
-Built on pdfplumber (the same lib the ingest pipeline already uses).
+Built on PyMuPDF (fitz) for fast font/size/bold extraction (≈10-50x faster than
+pdfplumber on large PDFs; 1089-page MIL-STD-810H heading scan: ~14 min → ~1 min).
 """
 from __future__ import annotations
 
@@ -27,10 +28,9 @@ import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
 
-import pdfplumber
+import fitz  # PyMuPDF
 
 _METHOD_RE = re.compile(r"^\s*METHOD\s+(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 _ANNEX_IN_METHOD_RE = re.compile(r"ANNEX\s+([A-Z])\b", re.IGNORECASE)
@@ -56,33 +56,35 @@ def _local_parent(number: str) -> Optional[str]:
     return number.rsplit(".", 1)[0] if "." in number else None
 
 
+_BOLD_FLAG = 1 << 4  # fitz span flag bit for bold
+
+
 def _page_lines(page):
-    """Group a page's words into lines, carrying dominant font size + boldness per line."""
-    try:
-        words = page.extract_words(extra_attrs=["size", "fontname"], use_text_flow=True)
-    except Exception:
-        words = page.extract_words(use_text_flow=True)
-    lines: Dict[float, list] = {}
-    for w in words:
-        lines.setdefault(round(float(w.get("top", 0.0)), 1), []).append(w)
+    """Lines of a fitz page, each with dominant font size + boldness (PyMuPDF dict)."""
     out = []
-    for ytop, ws in sorted(lines.items()):
-        ws.sort(key=lambda w: w.get("x0", 0.0))
-        text = " ".join(w["text"] for w in ws).strip()
-        if not text:
-            continue
-        sizes = [round(float(w.get("size", 0) or 0), 1) for w in ws if w.get("size")]
-        dom = Counter(sizes).most_common(1)[0][0] if sizes else 0.0
-        bold = sum(1 for w in ws if "bold" in str(w.get("fontname", "")).lower())
-        out.append((ytop, dom, bold > len(ws) * 0.6, text))
+    data = page.get_text("dict")
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            text = "".join(s.get("text", "") for s in spans).strip()
+            if not text:
+                continue
+            ytop = round(float(line.get("bbox", [0, 0, 0, 0])[1]), 1)
+            sizes = [round(float(s.get("size", 0) or 0), 1) for s in spans if s.get("size")]
+            dom = Counter(sizes).most_common(1)[0][0] if sizes else 0.0
+            bold = sum(1 for s in spans
+                       if (int(s.get("flags", 0)) & _BOLD_FLAG)
+                       or "bold" in str(s.get("font", "")).lower())
+            out.append((ytop, dom, bold > len(spans) * 0.6, text))
+    out.sort(key=lambda r: r[0])
     return out
 
 
-def _iter_lines(pdf):
-    """Yield (pageno, lines) and gather body baseline stats in one pass."""
+def _iter_lines(doc):
+    """Yield (pageno, lines) and gather body baseline stats in one pass (fitz doc)."""
     pages, all_sizes, bold_lines, total = [], [], 0, 0
-    for pageno, page in enumerate(pdf.pages, start=1):
-        lines = _page_lines(page)
+    for pageno in range(1, doc.page_count + 1):
+        lines = _page_lines(doc[pageno - 1])
         pages.append((pageno, lines))
         for _, dom, is_bold, _t in lines:
             if dom:
@@ -129,20 +131,20 @@ def _is_heading_line(txt, body, bold_is_signal, dom, is_bold):
 def extract_sections(pdf_bytes: bytes) -> List[Heading]:
     """Return ordered, scope-keyed section headings for the whole document (no LLM)."""
     try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            pages, body, bold_is_signal = _iter_lines(pdf)
-            headings: List[Heading] = []
-            sm, sa = None, None  # scope_method, scope_annex
-            for pageno, lines in pages:
-                if any("CONTENTS" in t.upper() for (_, _, _, t) in lines):
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            pages, body, bold_is_signal = _iter_lines(doc)
+        headings: List[Heading] = []
+        sm, sa = None, None  # scope_method, scope_annex
+        for pageno, lines in pages:
+            if any("CONTENTS" in t.upper() for (_, _, _, t) in lines):
+                continue
+            for (ytop, dom, is_bold, txt) in lines:
+                if not _is_heading_line(txt, body, bold_is_signal, dom, is_bold):
                     continue
-                for (ytop, dom, is_bold, txt) in lines:
-                    if not _is_heading_line(txt, body, bold_is_signal, dom, is_bold):
-                        continue
-                    h, sm, sa = _classify(txt, pageno, ytop, sm, sa)
-                    if h:
-                        headings.append(h)
-            return headings
+                h, sm, sa = _classify(txt, pageno, ytop, sm, sa)
+                if h:
+                    headings.append(h)
+        return headings
     except Exception:
         return []
 
@@ -161,26 +163,26 @@ def build_section_spec_map(pdf_bytes: bytes) -> Tuple[List[Heading], Dict[str, S
     doc_specs: Set[str] = set()
     headings: List[Heading] = []
     try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            pages, body, bold_is_signal = _iter_lines(pdf)
-            sm, sa, current = None, None, None  # scopes + active section key
-            for pageno, lines in pages:
-                if any("CONTENTS" in t.upper() for (_, _, _, t) in lines):
-                    continue
-                for (ytop, dom, is_bold, txt) in lines:
-                    if _is_heading_line(txt, body, bold_is_signal, dom, is_bold):
-                        h, sm, sa = _classify(txt, pageno, ytop, sm, sa)
-                        if h:
-                            headings.append(h)
-                            current = h.key
-                            continue
-                    specs = {s.canonical_id for s in kg_extractor.extract_specs(txt)}
-                    if not specs:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            pages, body, bold_is_signal = _iter_lines(doc)
+        sm, sa, current = None, None, None  # scopes + active section key
+        for pageno, lines in pages:
+            if any("CONTENTS" in t.upper() for (_, _, _, t) in lines):
+                continue
+            for (ytop, dom, is_bold, txt) in lines:
+                if _is_heading_line(txt, body, bold_is_signal, dom, is_bold):
+                    h, sm, sa = _classify(txt, pageno, ytop, sm, sa)
+                    if h:
+                        headings.append(h)
+                        current = h.key
                         continue
-                    if current:
-                        section_specs.setdefault(current, set()).update(specs)
-                    else:
-                        doc_specs.update(specs)
+                specs = {s.canonical_id for s in kg_extractor.extract_specs(txt)}
+                if not specs:
+                    continue
+                if current:
+                    section_specs.setdefault(current, set()).update(specs)
+                else:
+                    doc_specs.update(specs)
     except Exception:
         return headings, section_specs, doc_specs
     return headings, section_specs, doc_specs
