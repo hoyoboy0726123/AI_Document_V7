@@ -509,6 +509,58 @@ def _tool_coverage_check(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
 # ───── Registry ───────────────────────────────────────────────────────────
 
 
+def _tool_section_lookup(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a METHOD / numbered section by name (e.g. 'Method 510.7', '510.7', '504.3 2.2.2')
+    and return every external standard referenced anywhere in its sub-tree, with the citing section.
+    Section canonical_ids are scope-keyed (doc:ID#510.7, doc:ID#510.7/4.1.1.4) so the whole
+    sub-tree is one prefix LIKE."""
+    name = str(params.get("name") or params.get("method") or params.get("section") or "").strip()
+    if not name:
+        return {"error": "name is required"}
+    rows = kg_service.search_entities(db, name, limit=25)
+    cands = [r for r in rows if r.type in ("method", "section", "annex")]
+    if not cands:
+        return {"error": f"no method/section node matches '{name}'", "hint": "try rag_search"}
+    # prefer a method node, then the shortest canonical_id (closest to the named scope root)
+    cands.sort(key=lambda r: (r.type != "method", len(r.canonical_id or "")))
+    node = cands[0]
+    prefix = node.canonical_id
+    subtree = (
+        db.query(models.KGEntity)
+        .filter(
+            (models.KGEntity.canonical_id == prefix)
+            | (models.KGEntity.canonical_id.like(prefix + "/%"))
+        )
+        .all()
+    )
+    id_to_ent = {e.id: e for e in subtree}
+    rel_rows = (
+        db.query(models.KGRelation)
+        .filter(models.KGRelation.src_id.in_(list(id_to_ent.keys())),
+                models.KGRelation.rel_type == "references")
+        .all()
+    )
+    dst_ids = list({r.dst_id for r in rel_rows})
+    dst_ents = {e.id: e for e in db.query(models.KGEntity).filter(models.KGEntity.id.in_(dst_ids)).all()} if dst_ids else {}
+    specs_total: set = set()
+    by_section: List[Dict[str, Any]] = []
+    for r in rel_rows:
+        dst = dst_ents.get(r.dst_id)
+        if not dst or dst.type in ("section", "method", "annex", "document"):
+            continue
+        specs_total.add(dst.canonical_id)
+        src = id_to_ent.get(r.src_id)
+        by_section.append({"section": (src.name if src else None), "references": dst.canonical_id})
+    return {
+        "matched": node.canonical_id,
+        "name": node.name,
+        "type": node.type,
+        "subtree_nodes": len(subtree),
+        "referenced_standards": sorted(specs_total),
+        "by_section": by_section[:80],
+    }
+
+
 TOOLS: Dict[str, Tool] = {
     "rag_search": Tool(
         name="rag_search",
@@ -567,6 +619,23 @@ TOOLS: Dict[str, Tool] = {
             "required": ["spec_id"],
         },
         run=_tool_spec_supersedes_chain,
+    ),
+    "section_lookup": Tool(
+        name="section_lookup",
+        description=(
+            "Given a METHOD or numbered section name/id (e.g. 'Method 510.7', '510.7', "
+            "'504.3 2.2.2'), return EVERY external standard that method/section (and its whole "
+            "sub-tree) references, with the citing section. USE THIS for questions like "
+            "'what standards does Method 510.7 reference/cite', '方法 510.7 引用了哪些規範', "
+            "'什麼標準被 §X 引用' — test methods/sections are graph nodes, so this is exact where "
+            "rag_search would be vague or miss the reference list."
+        ),
+        schema={
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "method/section name or number"}},
+            "required": ["name"],
+        },
+        run=_tool_section_lookup,
     ),
     "document_get": Tool(
         name="document_get",

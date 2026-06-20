@@ -47,13 +47,21 @@ reference edges**. Spot-checks: `#510.7` and `#504.3` are method nodes with thei
 `#504.3-A` (ANNEX A) children are `504.3-A/1 GASOLINE FUELS…`, correctly **not** colliding with the
 method's own `504.3/1 SCOPE`.
 
+## Agent reachability — DONE
+
+`agent_tools.section_lookup(name)` resolves a METHOD/section by name or number
+("Method 510.7", "510.7"), pulls its whole scope-keyed sub-tree (`doc:ID#510.7` +
+`doc:ID#510.7/%`) and returns `referenced_standards` (+ `by_section`). The agent system
+prompt routes "what standards does Method/§X reference" to it. Because grounded synthesis
+(gemma4) tends to under-weight the KG block, `agent.run_agent` also **deterministically
+appends** the authoritative `referenced_standards` list to the final answer. Verified:
+*"Method 510.7 引用了哪些外部規範?"* → answer ends with `ASTM D185-07、IEC 60068-2-68、
+MIL-HDBK-310、MIL-STD-210B、MIL-STD-3033、MIL-STD-810` (vs the old vague "no external
+standards" answer before the feature).
+
 ## Still TODO (follow-ups, not blockers)
 
-1. **Agent reachability.** Extend `agent_tools` so method/section nodes are queryable: have
-   `spec_lookup` / a new `section_lookup` resolve `doc:{id}#{number}` and "METHOD n", and let
-   `spec_references` traverse section→Standard edges. Until then the nodes exist + are visible in
-   the `/knowledge-graph` page but the ReAct agent can't look a method up by name.
-2. **Spec attribution is line-level** within the document walk (current section = last heading
+1. **Spec attribution is line-level** within the document walk (current section = last heading
    seen). Good for reference lists/tables; revisit only if cross-section bleed appears.
 3. **Unnumbered headings** (e.g. "INTRODUCTION") are intentionally not emitted (avoids WARNING/
    table-label noise). If a target doc relies on them, add a stricter unnumbered rule or use the

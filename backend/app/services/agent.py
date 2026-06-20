@@ -49,6 +49,9 @@ different topic than what was asked. Retrieved snippets are EVIDENCE, not a redi
 a search surfaces a similarly-named but different item, do not pivot to it. Your final_answer \
 must answer the ORIGINAL question's subject.
 - Use spec_lookup BEFORE spec_references / spec_supersedes_chain to resolve canonical_id.
+- For "what standards/specs does METHOD or section X reference/cite" ("方法/§X 引用了哪些規範/標準"), \
+call section_lookup(name) — test methods and numbered sections are graph nodes with an EXACT \
+reference list (rag_search is vague and misses the reference table). e.g. section_lookup("Method 510.7").
 - For enumeration / listing questions ("what items/tests does X have", "有哪些", "list all", \
 "子項目", "sub-tests of X"), call list_subitems(name) FIRST. It returns the COMPLETE set from \
 the knowledge graph; rag_search alone retrieves only top-k chunks and WILL miss items.
@@ -500,6 +503,7 @@ def run_agent(
     # Phase 0：蒐集證據供最後 grounded 合成（rag_search 命中段落 + KG/spec 關聯）
     rag_evidence: List[Dict[str, Any]] = []
     kg_notes: List[str] = []
+    section_lookup_obs: Optional[Dict[str, Any]] = None  # 權威的 method/section 引用清單（確定性附加）
     kg_edges_seen = 0  # Phase 3：圖譜關聯數，供完整度反問
     structural_results: List[Dict[str, Any]] = []  # list_subitems 的權威完整清單（列舉題確定性作答）
     seeded: List[Dict[str, Any]] = []   # 保留供後段「補過仍無證據」的低信心兜底
@@ -616,11 +620,13 @@ def run_agent(
                 refs = observation.get("references") or []
                 if refs:
                     kg_notes.append(f"「{observation.get('matched')}」引用的標準：{'、'.join(refs)}")
-            elif action in ("spec_references", "spec_supersedes_chain", "spec_lookup", "document_get"):
+            elif action in ("spec_references", "spec_supersedes_chain", "spec_lookup", "section_lookup", "document_get"):
                 if "error" not in observation:
                     kg_notes.append(f"{action} → " + json.dumps(observation, ensure_ascii=False)[:900])
                     if action == "spec_references":
                         kg_edges_seen += len(observation.get("outgoing", [])) + len(observation.get("incoming", []))
+                    if action == "section_lookup" and observation.get("referenced_standards"):
+                        section_lookup_obs = observation  # 權威清單，稍後確定性附加進答案
 
         # Append to scratchpad so the LLM sees its previous tool call + result
         scratchpad.append({
@@ -723,5 +729,17 @@ def run_agent(
                               "page": ev.get("page"), "snippet": ev.get("snippet"),
                               "score": ev.get("score")} for ev in seeded[:5]]
     # else：有證據但合成不出 → 保留 ReAct 迴圈自己的 final_text。
+
+    # 確定性附加：section_lookup 的權威引用清單（grounded 合成常偏好 RAG 片段而漏掉此清單，
+    # 故直接從知識圖譜的結構化結果補上，保證 method/section 的外部規範清單一定出現在答案中）。
+    if section_lookup_obs and section_lookup_obs.get("referenced_standards"):
+        std = [s for s in section_lookup_obs["referenced_standards"]
+               if not str(s).startswith("doc:") and str(s) not in ("MIL-STD-810H",)]
+        if std:
+            name = section_lookup_obs.get("name") or section_lookup_obs.get("matched")
+            block = (f"\n\n---\n📋 知識圖譜：**{name}** 全章節引用的外部規範（共 {len(std)} 項）：\n"
+                     + "、".join(std))
+            if block.strip() not in (final_text or ""):
+                final_text = (final_text or "").rstrip() + block
 
     yield {"type": "final", "text": final_text, "sources": final_sources}
