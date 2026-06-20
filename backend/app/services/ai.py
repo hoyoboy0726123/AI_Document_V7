@@ -351,7 +351,9 @@ def generate_rag_answer(
         return '查無足夠的相關內容，請提供更多文件或調整問題。'
 
     messages = _build_rag_messages(question, context_blocks, conversation_history, system_prompt, user_template)
-    return _chat_with_provider(messages, think=True)
+    # think=False: thinking models (gemma4) otherwise spend 60-120s reasoning per answer
+    # and blow past OLLAMA_TIMEOUT. Disabling thinking is ~10x faster with equal/better answers.
+    return _chat_with_provider(messages, think=False)
 
 
 _LOWCONF_TEMPLATE_TIPS = (
@@ -427,7 +429,7 @@ def generate_rag_answer_stream(
     provider = get_llm_provider()
     if getattr(provider, "name", "ollama") == "ollama":
         client = get_client()
-        for chunk in client.chat_stream(messages, model=settings.OLLAMA_LLM_MODEL, think=True):
+        for chunk in client.chat_stream(messages, model=settings.OLLAMA_LLM_MODEL, think=False):
             yield chunk
     else:
         for chunk in provider.chat_stream(messages):

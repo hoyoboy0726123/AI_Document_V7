@@ -433,8 +433,10 @@ class OllamaClient:
             "stream": False,
             "keep_alive": self.keep_alive,
         }
-        if think:
-            payload["think"] = True
+        # Always send `think` explicitly. Omitting it makes Ollama fall back to the
+        # model's default, and thinking models (e.g. gemma4) default to thinking ON,
+        # which makes every RAG/chat call slow enough to hit OLLAMA_TIMEOUT.
+        payload["think"] = think
         if format:
             payload["format"] = format
         default_opts = self._default_options()
@@ -643,8 +645,10 @@ class OllamaClient:
             "stream": True,
             "keep_alive": self.keep_alive,
         }
-        if think:
-            payload["think"] = True
+        # Always send `think` explicitly. Omitting it makes Ollama fall back to the
+        # model's default, and thinking models (e.g. gemma4) default to thinking ON,
+        # which makes every RAG/chat call slow enough to hit OLLAMA_TIMEOUT.
+        payload["think"] = think
         default_opts = self._default_options()
         if options:
             merged = {**default_opts, **options}

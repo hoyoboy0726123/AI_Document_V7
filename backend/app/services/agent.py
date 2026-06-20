@@ -502,36 +502,20 @@ def run_agent(
     kg_notes: List[str] = []
     kg_edges_seen = 0  # Phase 3：圖譜關聯數，供完整度反問
     structural_results: List[Dict[str, Any]] = []  # list_subitems 的權威完整清單（列舉題確定性作答）
+    seeded: List[Dict[str, Any]] = []   # 保留供後段「補過仍無證據」的低信心兜底
+    seed_conf: Optional[float] = None
+    threshold = getattr(settings, "RAG_LOWCONF_CE_THRESHOLD", 0.15)
 
     # 雲地相容 seed：先用「使用者原始問題」做一次確定性檢索，把命中段落放進 rag_evidence。
-    # 關鍵：走 /rag/query 完全相同的檢索（_hybrid_filtered + 同樣的 context 預算），
-    # 而不是 agent 自己那條較弱的 rag_search 工具——後者排序不同會把資料表排到預算外。
-    # 這保證最終 grounded 合成一定握有「對的證據」，不因換模型（尤其雲端）在 ReAct loop
-    # 自擬關鍵字偏掉而撈錯段。ReAct loop 仍照常進行、可再補 KG/額外證據；合成時會去重。
+    # 走 /rag/query 完全相同的檢索，保證最終 grounded 合成握有「對的證據」。
+    # 注意：此處「不」因低信心就短路結束——改由後段「合成 → 不足則自動補充一輪 → 仍不足才低信心」
+    # 處理，避免在 ReAct 工具迴圈跑之前就放棄 KG/結構工具能回答的題型（如版本/取代/引用類）。
     try:
         seeded, seed_conf = _seed_evidence_via_rag(db, question, top_k=5)
         rag_evidence.extend(seeded)
         if seeded:
             yield {"type": "thought", "step": 0,
                    "text": "先以原始問題做一次基準檢索（與 RAG 同一條 pipeline），確保證據齊全且與所用模型無關。"}
-        # 低信心 fallback（與 RAG 模式一致）：最相關段落 CE 分數低於門檻 → 不硬跑 ReAct，
-        # 直接回「最接近內容 + 修正建議」。
-        threshold = getattr(settings, "RAG_LOWCONF_CE_THRESHOLD", 0.15)
-        # 列舉題交給下方 KG 列舉 fallback，不在這裡因 RAG 信心低就放棄。
-        if seed_conf is not None and seed_conf < threshold and not _looks_like_enumeration(question):
-            closest = [
-                {"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
-                for ev in seeded[:3]
-            ]
-            low_sources = [
-                {"document_id": ev.get("document_id"), "title": ev.get("title"),
-                 "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
-                for ev in seeded[:5]
-            ]
-            yield {"type": "final",
-                   "text": ai.low_confidence_answer(question, closest),
-                   "sources": low_sources}
-            return
     except Exception as e:
         logger.warning("agent seed retrieval failed: %s", e)
 
@@ -678,21 +662,66 @@ def run_agent(
         yield {"type": "final", "text": body, "sources": enum_sources}
         return
 
-    # Phase 0：若過程有檢索/KG 證據，最後用 RAG grounding prompt 重新合成帶引用的答案。
-    # 合成失敗或無證據時，退回 ReAct 自己的 final_answer。
-    # Phase 3：合成後依啟發式判斷「還有沒有未展開的來源/關聯」，有的話在答案末尾反問。
+    # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。
     final_sources: List[Dict[str, Any]] = []
-    if rag_evidence or kg_notes:
+
+    def _synthesize():
+        """用目前的 rag_evidence + kg_notes 跑帶引用的合成，回傳 (答案含覆蓋反問, 來源, n_used)。"""
+        if not (rag_evidence or kg_notes):
+            return None, [], 0
         try:
-            grounded, final_sources, n_used, n_total = _grounded_synthesis(
+            g, srcs, n_used, n_total = _grounded_synthesis(
                 db, question, rag_evidence, kg_notes, conversation_history
             )
-            if grounded and grounded.strip():
-                final_text = grounded.strip()
+            if g and g.strip():
                 note = _coverage_note(max(0, n_total - n_used), kg_edges_seen)
-                if note:
-                    final_text += note
+                return g.strip() + (note or ""), srcs, n_used
         except Exception as e:
-            logger.warning("grounded synthesis failed, using raw final_answer: %s", e)
+            logger.warning("grounded synthesis failed: %s", e)
+        return None, [], 0
+
+    synth, syn_sources, n_used = _synthesize()
+
+    # 充足性檢查（確定性，不靠 LLM）：合成不出，或「迴圈完全沒撈到 KG 關聯且 seed 向量信心偏低」
+    # → 答案只靠弱向量證據，視為不足，自動補充一輪（更廣檢索 + 規範關聯展開）後重新合成。
+    weak = (synth is None) or (not kg_notes and seed_conf is not None and seed_conf < threshold)
+    if weak:
+        try:
+            yield {"type": "thought", "step": max_steps + 1,
+                   "text": "初次證據不足，自動補充一輪（更廣檢索＋規範關聯展開）後重新作答。"}
+            # (1) 更廣的檢索（提高 top_k），去重併入既有證據
+            more, _ = _seed_evidence_via_rag(db, question, top_k=10)
+            seen = {(e.get("document_id"), e.get("page"),
+                     (e.get("snippet") or e.get("text") or "")[:48]) for e in rag_evidence}
+            for e in more:
+                k = (e.get("document_id"), e.get("page"),
+                     (e.get("snippet") or e.get("text") or "")[:48])
+                if k not in seen:
+                    rag_evidence.append(e)
+                    seen.add(k)
+            # (2) 問題若含規範 ID → 自動 KG 展開引用關聯（「向量弱但 KG 強」題型的關鍵補充）
+            from . import kg_extractor
+            for sm in kg_extractor.extract_specs(question)[:4]:
+                obs = agent_tools.run_tool(db, "spec_references", {"spec_id": sm.canonical_id, "hops": 1})
+                if isinstance(obs, dict) and "error" not in obs:
+                    kg_notes.append("spec_references → " + json.dumps(obs, ensure_ascii=False)[:900])
+                    kg_edges_seen += len(obs.get("outgoing", [])) + len(obs.get("incoming", []))
+            synth, syn_sources, n_used = _synthesize()
+        except Exception as e:
+            logger.warning("agent supplement round failed: %s", e)
+
+    if synth and synth.strip():
+        final_text = synth
+        final_sources = syn_sources
+    elif not (rag_evidence or kg_notes):
+        # 補過仍無任何證據 → 誠實低信心兜底（真正的最後手段，移到流程末端）。
+        closest = [{"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
+                   for ev in seeded[:3]]
+        if closest:
+            final_text = ai.low_confidence_answer(question, closest)
+            final_sources = [{"document_id": ev.get("document_id"), "title": ev.get("title"),
+                              "page": ev.get("page"), "snippet": ev.get("snippet"),
+                              "score": ev.get("score")} for ev in seeded[:5]]
+    # else：有證據但合成不出 → 保留 ReAct 迴圈自己的 final_text。
 
     yield {"type": "final", "text": final_text, "sources": final_sources}
