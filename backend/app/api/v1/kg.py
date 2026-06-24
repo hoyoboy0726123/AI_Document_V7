@@ -174,8 +174,11 @@ def extract_for_document(
     db.commit()
     db.refresh(task)
 
-    background_tasks.add_task(kg_pipeline.run_kg_extract_task, task.id, document_id)
-    return {"task_id": task.id, "document_id": document_id}
+    # serialise through the single KG worker (avoids SQLite write-lock contention
+    # when many docs are queued at once); task shows as pending until the worker reaches it
+    from ...services import kg_queue
+    depth = kg_queue.enqueue(task.id, document_id)
+    return {"task_id": task.id, "document_id": document_id, "queue_depth": depth}
 
 
 @router.delete("/document/{document_id}/relations", status_code=204)

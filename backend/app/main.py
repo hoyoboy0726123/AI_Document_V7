@@ -249,6 +249,11 @@ ensure_default_admin()
 apply_llm_overrides_from_db()
 apply_ocr_overrides_from_db()
 
+# Start the single serial KG worker (KG extraction is funneled through it to avoid
+# concurrent SQLite writers; see services/kg_queue.py).
+from .services import kg_queue as _kg_queue
+_kg_queue.start_worker()
+
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
 

@@ -11,9 +11,9 @@ import {
   List,
   Modal,
   Row,
+  Segmented,
   Select,
   Space,
-  Switch,
   Tag,
   Timeline,
   Tooltip,
@@ -46,8 +46,14 @@ const QAConsolePage = () => {
   const [pdfPreview, setPdfPreview] = useState({ open: false, documentId: null, title: "", page: 1 });
   const [followupQuestion, setFollowupQuestion] = useState("");
   const [expandedSnippets, setExpandedSnippets] = useState({});
-  const [agentMode, setAgentMode] = useState(() => {
-    try { return window.localStorage.getItem("qa_agent_mode") === "1"; } catch { return false; }
+  // 三模式:'rag'(純內容檢索) | 'hybrid'(自動路由,預設) | 'agent'(關係/多步)
+  const [qaMode, setQaMode] = useState(() => {
+    try {
+      const v = window.localStorage.getItem("qa_mode");
+      if (v === "rag" || v === "hybrid" || v === "agent") return v;
+      // 舊設定相容:之前的 Agent 開關
+      return window.localStorage.getItem("qa_agent_mode") === "1" ? "agent" : "hybrid";
+    } catch { return "hybrid"; }
   });
   const [saveNoteModal, setSaveNoteModal] = useState({ visible: false, msg: null });
   const [saveNoteDocId, setSaveNoteDocId] = useState(null);
@@ -160,13 +166,13 @@ const QAConsolePage = () => {
     }
   };
 
-  // Agent mode — SSE stream from /agent/chat
-  const postAgentStream = async (payload, { onEvent, onFinal, onDone, onError }) => {
+  // Agent / hybrid mode — SSE stream (default /agent/chat; hybrid uses /agent/route)
+  const postAgentStream = async (payload, { onEvent, onFinal, onDone, onError }, url = "/api/v1/agent/chat") => {
     const token = getToken();
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const resp = await fetch("/api/v1/agent/chat", {
+    const resp = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -284,6 +290,54 @@ const QAConsolePage = () => {
     }
   };
 
+  // 混合模式 — 打 /agent/route,先收 route 事件(知道被判到哪一邊),再串流 agent 步驟或直接 final
+  const runRouteStream = async (question) => {
+    setLoading(true);
+    setStreamingMsg({
+      question, thinking: "", answer: "", isStreaming: true, thinkingDone: false,
+      sources: [], agentMode: true, hybrid: true, routedMode: null, agentSteps: [],
+    });
+    const historyForAgent = conversationHistory.map((m) => ({ question: m.question, answer: m.answer }));
+    try {
+      await postAgentStream({ question, conversation_history: historyForAgent, max_steps: 8, top_k: 5 }, {
+        onEvent: (eventName, data) => {
+          if (eventName === "route") {
+            // rag 子模式不需要顯示「推理過程」面板
+            setStreamingMsg((prev) => prev ? { ...prev, routedMode: data.mode, agentMode: data.mode === "agent" } : null);
+            return;
+          }
+          setStreamingMsg((prev) => prev ? { ...prev, agentSteps: [...(prev.agentSteps || []), { event: eventName, ...data }] } : null);
+        },
+        onFinal: (data) => {
+          setStreamingMsg((prev) => prev ? { ...prev, answer: data.text || "", sources: data.sources || [], thinkingDone: true } : null);
+        },
+        onDone: () => {
+          setStreamingMsg((prev) => {
+            if (!prev) return null;
+            const newMsg = {
+              question: prev.question, answer: prev.answer, sources: prev.sources || [],
+              is_followup: false, optimized_query: null, thinking: "", suggested_questions: [],
+              used_ai_fallback: false, agentMode: prev.routedMode === "agent", hybrid: true,
+              routedMode: prev.routedMode, agentSteps: prev.agentSteps || [], timestamp: new Date().toISOString(),
+            };
+            setConversationHistory((h) => [...h, newMsg]);
+            return null;
+          });
+          setLoading(false);
+          abortRef.current = null;
+        },
+        onError: (errMsg) => {
+          message.error(errMsg || "混合查詢失敗");
+          setStreamingMsg(null); setLoading(false); abortRef.current = null;
+        },
+      }, "/api/v1/agent/route");
+    } catch (err) {
+      const msg = err?.message || "混合查詢失敗";
+      if (/abort|cancel/i.test(String(msg))) message.info("已停止查詢"); else message.error(msg);
+      setStreamingMsg(null); setLoading(false); abortRef.current = null;
+    }
+  };
+
   const runStream = async (payload, question) => {
     setLoading(true);
     setStreamingMsg({ question, thinking: "", answer: "", isStreaming: true, thinkingDone: false, sources: [], is_followup: false, optimized_query: null });
@@ -345,10 +399,8 @@ const QAConsolePage = () => {
     if (!question) { message.warning("請輸入問題"); return; }
     form.setFieldValue("question", "");
 
-    if (agentMode) {
-      await runAgentStream(question);
-      return;
-    }
+    if (qaMode === "agent") { await runAgentStream(question); return; }
+    if (qaMode === "hybrid") { await runRouteStream(question); return; }
 
     const { document_id, folder_ids } = decodeDocScope(values.doc_scope);
     const payload = {
@@ -365,20 +417,18 @@ const QAConsolePage = () => {
     await runStream(payload, question);
   };
 
-  const toggleAgentMode = (checked) => {
-    setAgentMode(checked);
-    try { window.localStorage.setItem("qa_agent_mode", checked ? "1" : "0"); } catch { /* ignore */ }
+  const changeQaMode = (mode) => {
+    setQaMode(mode);
+    try { window.localStorage.setItem("qa_mode", mode); } catch { /* ignore */ }
   };
 
   const handleFollowupSubmit = async () => {
     const question = followupQuestion?.trim();
     if (!question) { message.warning("請輸入追問內容"); return; }
     setFollowupQuestion("");
-    // 追問沿用目前模式：Agent 模式的追問也走 Agent。
-    if (agentMode) {
-      await runAgentStream(question);
-      return;
-    }
+    // 追問沿用目前模式。
+    if (qaMode === "agent") { await runAgentStream(question); return; }
+    if (qaMode === "hybrid") { await runRouteStream(question); return; }
     const currentFormValues = form.getFieldsValue();
     const { document_id, folder_ids } = decodeDocScope(currentFormValues.doc_scope);
     const payload = {
@@ -725,17 +775,33 @@ const QAConsolePage = () => {
             title="查詢設定"
             style={{ position: "sticky", top: 16 }}
             extra={
-              <Tooltip title="一般文件問答用傳統 RAG 即可（答案較完整、附來源、較快）。當問題需要跨規範追關聯（例如「A 引用哪些標準、被誰取代」）或多步推理時，再開啟 Agent。">
+              <Tooltip title="混合(預設):自動判斷問題類型 — 內容題(怎麼進行/數值)走純 RAG(快、完整);關係題(引用/取代/版本/有哪些子項)走 Agent(KG 工具)。也可手動鎖定純 RAG 或 Agent。">
                 <Space size={4} style={{ cursor: "help" }}>
-                  <RobotOutlined style={{ color: agentMode ? "#1677ff" : "#999" }} />
-                  <Text style={{ fontSize: 12, color: agentMode ? "#1677ff" : "#999" }}>Agent</Text>
+                  <Segmented
+                    size="small"
+                    value={qaMode}
+                    onChange={changeQaMode}
+                    options={[
+                      { label: "純RAG", value: "rag" },
+                      { label: "混合", value: "hybrid" },
+                      { label: "Agent", value: "agent" },
+                    ]}
+                  />
                   <QuestionCircleOutlined style={{ fontSize: 11, color: "#bbb" }} />
-                  <Switch size="small" checked={agentMode} onChange={toggleAgentMode} />
                 </Space>
               </Tooltip>
             }
           >
-            {agentMode && (
+            {qaMode === "hybrid" && (
+              <Alert
+                style={{ marginBottom: 12 }}
+                type="info"
+                showIcon
+                message="混合模式（自動路由）"
+                description="系統自動判定:內容題走純 RAG（快、完整）、關係題走 Agent（跨規範追引用/版本/結構）。每次查詢會標示實際走了哪一邊。"
+              />
+            )}
+            {qaMode === "agent" && (
               <Alert
                 style={{ marginBottom: 12 }}
                 type="info"
@@ -804,6 +870,11 @@ const QAConsolePage = () => {
                     <div style={{ marginBottom: 16 }}>
                       <Tag color="blue" style={{ fontSize: 14, padding: "4px 12px" }}>問題 {index + 1}</Tag>
                       {msg.is_followup && (<Tag color="orange" style={{ marginLeft: 8 }}>追問</Tag>)}
+                      {msg.hybrid && msg.routedMode && (
+                        <Tag color={msg.routedMode === "agent" ? "geekblue" : "green"} style={{ marginLeft: 8 }}>
+                          混合→{msg.routedMode === "agent" ? "關係查詢(Agent)" : "內容查詢(RAG)"}
+                        </Tag>
+                      )}
                       <Text strong style={{ fontSize: 16, marginLeft: 8 }}>{msg.question}</Text>
                       {msg.optimized_query && msg.optimized_query !== msg.question && (
                         <div style={{ marginTop: 8, paddingLeft: 12, borderLeft: "3px solid #1890ff" }}>
@@ -845,6 +916,11 @@ const QAConsolePage = () => {
                     <div style={{ marginBottom: 16 }}>
                       <Tag color="blue" style={{ fontSize: 14, padding: "4px 12px" }}>問題 {conversationHistory.length + 1}</Tag>
                       {streamingMsg.is_followup && <Tag color="orange" style={{ marginLeft: 8 }}>追問</Tag>}
+                      {streamingMsg.hybrid && (
+                        <Tag color={streamingMsg.routedMode === "agent" ? "geekblue" : (streamingMsg.routedMode === "rag" ? "green" : "default")} style={{ marginLeft: 8 }}>
+                          {streamingMsg.routedMode ? `混合→${streamingMsg.routedMode === "agent" ? "關係查詢(Agent)" : "內容查詢(RAG)"}` : "混合判定中…"}
+                        </Tag>
+                      )}
                       <Text strong style={{ fontSize: 16, marginLeft: 8 }}>{streamingMsg.question}</Text>
                       {streamingMsg.optimized_query && streamingMsg.optimized_query !== streamingMsg.question && (
                         <div style={{ marginTop: 8, paddingLeft: 12, borderLeft: "3px solid #1890ff" }}>

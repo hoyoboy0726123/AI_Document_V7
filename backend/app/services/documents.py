@@ -556,24 +556,25 @@ def run_document_finalize_task(
         db.commit()
 
         # 自動觸發 KG 抽取（settings.KG_AUTO_EXTRACT=True 時）。
-        # 這裡 inline 跑而不是再開背景任務，因為 finalize 本身已在背景執行緒；
+        # 透過 kg_queue 序列化：所有 KG 抽取共用單一 worker，一次只跑一個，
+        # 避免多份文件快速上傳時並行寫入 SQLite 造成 `database is locked`。
         # 失敗只記 log，不讓主任務變 failed。
         try:
             from ..core.config import settings as _settings
             if getattr(_settings, "KG_AUTO_EXTRACT", True):
-                from . import kg_pipeline as _kg_pipeline
+                from . import kg_queue as _kg_queue
                 kg_task = models.BackgroundTask(
                     task_type="kg_extract",
                     status="pending",
                     progress=0,
-                    message="準備抽取規範引用...",
+                    message="已排入 KG 佇列...",
                     document_id=document_id,
                     creator_id=document.creator_id,
                 )
                 db.add(kg_task)
                 db.commit()
                 db.refresh(kg_task)
-                _kg_pipeline.run_kg_extract_task(kg_task.id, document_id)
+                _kg_queue.enqueue(kg_task.id, document_id)
         except Exception as kg_exc:
             import logging
             logging.getLogger(__name__).warning(

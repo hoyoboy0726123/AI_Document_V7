@@ -168,6 +168,16 @@ def _tool_document_get(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _name_in_query(ename: str, ql: str) -> bool:
+    """反向比對：實體名稱(或其去括號核心，如 'MIL-STD-810H (full, plain-text)' → 'MIL-STD-810H')
+    是否出現在查詢字串內。讓「MIL-STD-810H 有哪些測試方法」也能對到該文件節點。"""
+    nm = (ename or "").lower().strip()
+    if len(nm) >= 3 and nm in ql:
+        return True
+    core = re.sub(r"\s*\(.*$", "", nm).strip()
+    return len(core) >= 4 and core in ql
+
+
 def _natural_key(number):
     """'12.10' 排在 '12.2' 之後（自然排序）。"""
     try:
@@ -188,7 +198,7 @@ def _tool_list_subitems(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
         ql = name.lower()
         cand = db.query(models.KGEntity).filter(models.KGEntity.type.in_(["section", "document"])).all()
         rows = sorted(
-            [e for e in cand if e.name and len(e.name) >= 3 and e.name.lower() in ql],
+            [e for e in cand if e.name and _name_in_query(e.name, ql)],
             key=lambda e: len(e.name or ""),
             reverse=True,
         )[:10]
@@ -218,20 +228,29 @@ def _tool_list_subitems(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
     if child_ids:
         emap = {e.id: e for e in db.query(models.KGEntity).filter(models.KGEntity.id.in_(child_ids)).all()}
         seen: set = set()
+        child_ents: List[Any] = []
         for cid in child_ids:
             if cid in seen:
                 continue
             seen.add(cid)
             c = emap.get(cid)
             if c:
-                meta = c.meta or {}
-                subitems.append({
-                    "name": c.name,
-                    "kind": meta.get("kind") or c.type,
-                    "number": meta.get("number"),
-                    "page": meta.get("page"),
-                    "document_id": meta.get("document_id"),
-                })
+                child_ents.append(c)
+        # 文件層級「有哪些測試/方法」= 該標準的測試方法(method)，不是每個編號章節
+        # (文件 contains 同時有 30 個 method + 24 個 section，混在一起且 section 編號小排在前會蓋掉方法)。
+        if ent.type == "document":
+            methods = [c for c in child_ents if c.type == "method"]
+            if methods:
+                child_ents = methods
+        for c in child_ents:
+            meta = c.meta or {}
+            subitems.append({
+                "name": c.name,
+                "kind": meta.get("kind") or c.type,
+                "number": meta.get("number"),
+                "page": meta.get("page"),
+                "document_id": meta.get("document_id"),
+            })
         subitems.sort(key=lambda x: _natural_key(x.get("number")))
 
     # 該節點引用的標準
@@ -268,7 +287,7 @@ def _resolve_named_structural(db: Session, name: str, prefer_parent: bool = Fals
         ql = name.lower()
         cand = db.query(models.KGEntity).filter(models.KGEntity.type.in_(["section", "document"])).all()
         rows = sorted(
-            [e for e in cand if e.name and len(e.name) >= 3 and e.name.lower() in ql],
+            [e for e in cand if e.name and _name_in_query(e.name, ql)],
             key=lambda e: len(e.name or ""), reverse=True,
         )[:10]
     if not rows:
@@ -506,6 +525,93 @@ def _tool_coverage_check(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
     return {"matched": ent.name, "item_count": len(items), "is_leaf": is_leaf, "items": items}
 
 
+_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+
+
+def _roman_to_int(s: str) -> int:
+    s = s.upper()
+    if s.isdigit():
+        return int(s)
+    total, prev = 0, 0
+    for ch in reversed(s):
+        v = _ROMAN.get(ch, 0)
+        total += -v if v < prev else v
+        prev = max(prev, v)
+    return total or 999
+
+
+# 標題形式（有破折號/冒號 + 大寫起頭的短標題）：PROCEDURE I - BLOWING DUST
+_PROC_TITLE_RE = re.compile(
+    r"\bPROCEDURE\s+([IVXLC]{1,5})\b\s*[-–—:]\s*([A-Z][A-Za-z0-9 ,/()\-]{1,45})",
+)
+# 僅偵測存在（含無標題者）：PROCEDURE I / Procedure II …（限羅馬數字，避免誤抓 '5. ANALYSIS'）
+_PROC_ANY_RE = re.compile(r"\bPROCEDURE\s+([IVXLC]{1,5})\b", re.IGNORECASE)
+_METHOD_NUM_RE = re.compile(r"\b(\d{3}\.\d{1,2})\b")
+
+
+def _tool_list_procedures(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
+    """列出某測試方法的「程序」(Procedure I/II/…)。程序不是 KG 節點，從該方法內文掃出。
+    用於「Method X 有哪些程序 / what procedures does X have」。"""
+    name = str(params.get("name") or params.get("method") or "").strip()
+    if not name:
+        return {"error": "name is required"}
+    rows = kg_service.search_entities(db, name, limit=25)
+    cands = [r for r in rows if r.type in ("method", "section", "annex")]
+    if not cands:  # 從問句抽方法號（如 '516.8'）再試
+        m = _METHOD_NUM_RE.search(name)
+        if m:
+            rows = kg_service.search_entities(db, m.group(1), limit=25)
+            cands = [r for r in rows if r.type in ("method", "section", "annex")]
+    if not cands:
+        return {"matched": None, "procedures": [], "hint": "no method node; try rag_search"}
+    cands.sort(key=lambda r: (r.type != "method", len(r.canonical_id or "")))
+    node = cands[0]
+    meta = node.meta or {}
+    doc_id, page = meta.get("document_id"), meta.get("page")
+    if not (doc_id and page):
+        return {"matched": node.canonical_id, "name": node.name, "procedures": []}
+    # 方法的 meta.page（標題偵測頁）可能比實際程序標題晚數頁，頁碼切片會錯位到下一方法。
+    # 改用每頁的「METHOD XXX」頁首歸屬：掃一個寬窗，依「最近出現的 METHOD 號」判斷目前所在方法。
+    qnum = node.canonical_id.split("#", 1)[1] if "#" in node.canonical_id else ""
+    method_pages = sorted(p for p in (
+        (e.meta or {}).get("page") for e in db.query(models.KGEntity).filter(models.KGEntity.type == "method").all()
+        if (e.meta or {}).get("document_id") == doc_id) if p)
+    next_page = next((x for x in method_pages if x > page), None)
+    lo = max(1, page - 8)
+    hi = (next_page + 3) if next_page else (page + 45)
+    chunks = (
+        db.query(models.DocumentChunk)
+        .filter(models.DocumentChunk.document_id == doc_id,
+                models.DocumentChunk.page >= lo, models.DocumentChunk.page <= hi)
+        .order_by(models.DocumentChunk.page, models.DocumentChunk.chunk_index)
+        .all()
+    )
+    joined = "\n".join(ch.text or "" for ch in chunks)
+    events = []  # (pos, kind, num, title)
+    for m in re.finditer(r"\bMETHOD\s+(\d{3}\.\d{1,2})\b", joined, re.IGNORECASE):
+        events.append((m.start(), "M", m.group(1), None))
+    for m in _PROC_ANY_RE.finditer(joined):
+        if _roman_to_int(m.group(1)) <= 12:
+            events.append((m.start(), "P", m.group(1).upper(), None))
+    for m in _PROC_TITLE_RE.finditer(joined):
+        if _roman_to_int(m.group(1)) <= 12:
+            events.append((m.start(), "T", m.group(1).upper(), re.split(r"[.\n;]", m.group(2))[0].strip(" -–—:.")))
+    events.sort(key=lambda e: e[0])
+    titles: Dict[str, str] = {}
+    present: set = set()
+    cur = None
+    for _pos, kind, num, title in events:
+        if kind == "M":
+            cur = num
+        elif cur == qnum:
+            present.add(num)
+            if kind == "T" and (num not in titles or 0 < len(title) < len(titles.get(num) or "9" * 99)):
+                titles[num] = title
+    nums = sorted(present | set(titles.keys()), key=_roman_to_int)
+    procs = [{"procedure": n, "title": titles.get(n, "")} for n in nums]
+    return {"matched": node.canonical_id, "name": node.name, "procedures": procs, "count": len(procs)}
+
+
 # ───── Registry ───────────────────────────────────────────────────────────
 
 
@@ -636,6 +742,21 @@ TOOLS: Dict[str, Tool] = {
             "required": ["name"],
         },
         run=_tool_section_lookup,
+    ),
+    "list_procedures": Tool(
+        name="list_procedures",
+        description=(
+            "List the test PROCEDURES (Procedure I, II, III …) of a test method. USE THIS for "
+            "'what procedures does Method X have', 'Method X 有哪些程序/程序有哪些'. Procedures are "
+            "NOT graph nodes — this scans the method's own text and returns each Procedure number "
+            "with its title (e.g. 'Procedure I - Blowing Dust')."
+        ),
+        schema={
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "method name/number, e.g. 'Method 516.8' or '516.8'"}},
+            "required": ["name"],
+        },
+        run=_tool_list_procedures,
     ),
     "document_get": Tool(
         name="document_get",

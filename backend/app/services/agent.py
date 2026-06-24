@@ -231,6 +231,134 @@ def _looks_like_enumeration(q: str) -> bool:
     return bool(_ENUM_RE.search(q or ""))
 
 
+# 混合查詢路由：關係/引用/版本/結構類 → 走 Agent（KG 工具有用、且 Agent 在這類是 RAG 超集）；
+# 純內容（怎麼進行/數值/條件/是什麼）→ 走純 RAG（更快、不會被 KG 工具淡化答案）。
+_RELATION_RE = re.compile(
+    r"(取代|被取代|沿革|演進|演化|版本|舊版|新版|前一?版|衍生|引用|參照|參考|依據|關係|"
+    r"引用鏈|版本鏈|誰引用|被.*引用|哪些(規範|標準|文件|method|方法)|跟.*關係|和.*關係|與.*關係|"
+    r"supersed|replace|deriv|references?|cite[sd]?|requires?|version|revision|lineage|predecessor|relationship)",
+    re.IGNORECASE,
+)
+
+
+# 結構列舉題（→ Agent 的 list_subitems）：要求列舉「結構性名詞」（子測試/方法/程序/章節…），
+# 刻意排除「哪些數值/資訊/數據/條件」這類其實是內容題的問法（那些走 RAG 更好）。
+_ENUM_STRUCT_RE = re.compile(
+    r"((子|sub-?\s?)(項目|測試|程序|test|item|procedure)|列出所有|全部列出|列舉|"
+    r"有哪些(測試|方法|程序|步驟|項目|子|method|annex|附錄|章節))",
+    re.IGNORECASE,
+)
+
+
+# 程序列舉題：「(Method X) 有哪些程序 / 程序有哪些 / what procedures」
+_PROC_Q_RE = re.compile(r"((有)?哪些|列出|列舉|what|which).{0,12}(程序|procedure)s?|(程序|procedure)s?\s*(有哪些|是什麼)", re.IGNORECASE)
+# 應用題（「我的設備該做哪些測試」）：不要被 spec 關係區塊劫持，交給合成。
+_APP_RE = re.compile(r"我的|我們|我要|該做|應(該|做)|需要做|產品|設備|裝在|用在|安裝|要符合")
+# 規範 id（用於確定性規範關係 fallback）：MIL-STD/HDBK/DTL/PRF、AR、ASTM、IEC、ISO、NATO STANAG
+_SPEC_ID_RE = re.compile(
+    r"\b(MIL-(?:STD|HDBK|DTL|PRF)-\d+[A-Z]?|AR\s?\d+-\d+|ASTM\s?[A-Z]?\d+|IEC\s?\d+(?:-\d+)*|ISO\s?\d+|NATO\s?STANAG\s?\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def route_mode(question: str) -> str:
+    """混合模式分類：回傳 'agent'（關係/引用/版本/結構列舉題）或 'rag'（純內容題）。"""
+    q = question or ""
+    if _RELATION_RE.search(q) or _ENUM_STRUCT_RE.search(q):
+        return "agent"
+    return "rag"
+
+
+def run_rag_only(db: Session, question: str,
+                 conversation_history: Optional[List[Dict[str, Any]]] = None):
+    """混合路由的純 RAG 分支：與 /rag/query 同一條檢索 + grounded 合成，回 (answer, sources)。"""
+    seeded, _conf = _seed_evidence_via_rag(db, question, top_k=5)
+    ans, sources, n_used, n_total = _grounded_synthesis(db, question, seeded, [], conversation_history)
+    if ans and ans.strip():
+        note = _coverage_note(max(0, n_total - n_used), 0)
+        return ans.strip() + (note or ""), sources
+    closest = [{"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
+               for ev in seeded[:3]]
+    low_src = [{"document_id": ev.get("document_id"), "title": ev.get("title"), "page": ev.get("page"),
+                "snippet": ev.get("snippet"), "score": ev.get("score")} for ev in seeded[:5]]
+    text = ai.low_confidence_answer(question, closest) if closest else "查無足夠的相關內容，請提供更多文件或調整問題。"
+    return text, low_src
+
+
+def _pick_spec_center(candidates: List[str], question: str) -> Optional[str]:
+    """從查過的規範中挑「問題裡實際提到的那個」當主體，避免被後續查的別的規範蓋掉
+    （如問 MIL-DTL-901 卻因 agent 又查了 MIL-STD-810H 而把主體變成 810H）。"""
+    if not candidates:
+        return None
+    qn = re.sub(r"[^A-Z0-9]", "", (question or "").upper())
+    for c in candidates:  # 保序：先到的（通常是主體）優先
+        cn = re.sub(r"[^A-Z0-9]", "", (c or "").upper())
+        if cn and cn in qn:
+            return c
+    return candidates[0]
+
+
+def _build_spec_relation_block(db: Session, canonical_id: str) -> Optional[str]:
+    """確定性「規範關係」區塊：版本家族 + 引用(outgoing) + 被引用(incoming)，直接查 KG。
+    避免 LLM 自由合成把現有的邊丟掉（觀察到 310↔210、X 被誰引用、版本鏈會漏）。"""
+    from .. import models
+    ent = db.query(models.KGEntity).filter_by(canonical_id=canonical_id).first()
+    if not ent or ent.type in ("section", "method", "annex", "document"):
+        return None
+    cid = ent.canonical_id
+    lines: List[str] = []
+
+    # 1) 版本家族：同基底 + 單一版本字母（810 / 810B…810H；210 / 210A…210C）
+    base = re.sub(r"(?<=\d)[A-Z]$", "", cid)            # 去掉緊接數字的尾端版本字母
+    fam_pat = re.compile("^" + re.escape(base) + r"[A-Z]?$")
+    fam = sorted({e.canonical_id for e in db.query(models.KGEntity)
+                  .filter(models.KGEntity.canonical_id.like(base + "%")).all()
+                  if fam_pat.match(e.canonical_id or "")})
+    if len(fam) > 1:
+        lines.append(f"**版本家族**（共 {len(fam)} 版）：{' → '.join(fam)} ，最新為 **{fam[-1]}**。")
+
+    def _readable(e) -> str:
+        c = e.canonical_id or ""
+        if e.type in ("section", "method", "annex") and c.startswith("doc:"):
+            did = c.split("doc:", 1)[1].split("#", 1)[0]
+            key = c.split("#", 1)[1] if "#" in c else ""
+            doc = db.query(models.Document).filter_by(id=did).first()
+            return f"{(doc.title if doc else did)} §{key}"
+        return c
+
+    # 2) outgoing：本規範引用了哪些其他標準
+    out_specs: set = set()
+    for r in db.query(models.KGRelation).filter_by(src_id=ent.id, rel_type="references").all():
+        t = db.query(models.KGEntity).filter_by(id=r.dst_id).first()
+        if t and t.type not in ("section", "method", "annex", "document") and t.canonical_id != cid:
+            out_specs.add(t.canonical_id)
+    if out_specs:
+        lines.append(f"**引用的其他標準**（{len(out_specs)} 項）：{'、'.join(sorted(out_specs))}")
+
+    # 3) incoming：哪些文件/章節引用了本規範（過濾自家文件的自我引用）
+    in_src: set = set()
+    for r in db.query(models.KGRelation).filter_by(dst_id=ent.id, rel_type="references").all():
+        s = db.query(models.KGEntity).filter_by(id=r.src_id).first()
+        if not s or s.canonical_id == cid:
+            continue
+        rd = _readable(s)
+        # 自我引用：來源章節所屬文件的標題基底 == 本規範基底 → 略過
+        if rd.startswith(f"{base}") or (s.type == "document" and (s.canonical_id or "").startswith("doc:")):
+            continue
+        in_src.add(rd)
+    if in_src:
+        lines.append(f"**被引用於**（{len(in_src)} 處）：{'、'.join(sorted(in_src)[:12])}")
+
+    # 4) 版本取代：直接由版本家族排序推導（新版取代舊版），不用 KG 的 supersedes 邊
+    #    —— 那些邊偶有 LLM 分類雜訊（方向相反、跨家族如 810H→167）。家族排序永遠正確。
+    if len(fam) > 1:
+        lines.append(f"**版本取代**：最新版 **{fam[-1]}** 取代先前版本（{' / '.join(fam[:-1])}）")
+
+    if not lines:
+        return None
+    return f"**{cid}** 的規範關係（依知識圖譜，非向量檢索）：\n\n" + "\n".join(f"- {ln}" for ln in lines)
+
+
 _OVERVIEW_RE = re.compile(
     r"(介紹|說明|概覽|概述|描述|重點|摘要|整理|內容|overview|brief|describe|summar|"
     r"tell me about|rundown|walk me through|各[項個種子]|每[項個種]|each\b|"
@@ -509,6 +637,7 @@ def run_agent(
     rag_evidence: List[Dict[str, Any]] = []
     kg_notes: List[str] = []
     section_lookup_obs: Optional[Dict[str, Any]] = None  # 權威的 method/section 引用清單（確定性附加）
+    spec_candidates: List[str] = []  # 過程中查到的規範 canonical_id（最後挑「問題提到的那個」當主體）
     kg_edges_seen = 0  # Phase 3：圖譜關聯數，供完整度反問
     structural_results: List[Dict[str, Any]] = []  # list_subitems 的權威完整清單（列舉題確定性作答）
     seeded: List[Dict[str, Any]] = []   # 保留供後段「補過仍無證據」的低信心兜底
@@ -630,6 +759,17 @@ def run_agent(
                     kg_notes.append(f"{action} → " + json.dumps(observation, ensure_ascii=False)[:900])
                     if action == "spec_references":
                         kg_edges_seen += len(observation.get("outgoing", [])) + len(observation.get("incoming", []))
+                        if observation.get("center"):
+                            spec_candidates.append(observation["center"])
+                    if action == "spec_lookup":
+                        for res in (observation.get("results") or []):
+                            if isinstance(res, dict) and res.get("type") not in (
+                                    "section", "method", "annex", "document") and res.get("canonical_id"):
+                                spec_candidates.append(res["canonical_id"]); break
+                    if action == "spec_supersedes_chain":
+                        for it in (observation.get("chain") or []):
+                            if it.get("is_center") and it.get("canonical_id"):
+                                spec_candidates.append(it["canonical_id"]); break
                     if action == "section_lookup" and observation.get("referenced_standards"):
                         section_lookup_obs = observation  # 權威清單，稍後確定性附加進答案
 
@@ -649,6 +789,36 @@ def run_agent(
     if final_text is None:
         final_text = "已達最大步數，未能整合出最終答案。建議縮小問題範圍後重試。"
 
+    # 應用題（「我的設備該做哪些測試」）：跳過所有「單一實體確定性區塊」（程序/列舉/section/spec），
+    # 直接走 RAG 合成 —— 那種問題要綜合多個方法與規範，硬套單一方法的結構清單會答非所問。
+    is_app = bool(_APP_RE.search(question or ""))
+
+    # 程序列舉題（「有哪些程序 / what procedures」）：Procedure 不是 KG 節點，從方法內文掃出
+    # Procedure I/II/…，優先於章節列舉/section_lookup（否則會回章節結構或引用清單而非程序）。
+    if not is_app and _PROC_Q_RE.search(question or ""):
+        pr = agent_tools.run_tool(db, "list_procedures", {"name": question})
+        if isinstance(pr, dict) and pr.get("procedures"):
+            head = pr.get("name") or pr.get("matched")
+            plines = [f"**{head}** 的測試程序（共 {pr.get('count')} 個，掃自方法內文）：", ""]
+            for p in pr["procedures"]:
+                t = p.get("title")
+                plines.append(f"- **Procedure {p['procedure']}**" + (f" — {t}" if t else ""))
+            block = "\n".join(plines)
+            rag_part, p_sources = None, []
+            try:
+                g, p_sources, _n, _t = _grounded_synthesis(db, question, rag_evidence, kg_notes, conversation_history)
+                if g and g.strip():
+                    rag_part = g.strip()
+            except Exception as e:
+                logger.warning("procedure block synthesis failed: %s", e)
+            body = block if not rag_part else f"{block}\n\n── 補充（文件內容檢索）──\n{rag_part}"
+            src = p_sources or [
+                {"document_id": ev.get("document_id"), "title": ev.get("title"),
+                 "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
+                for ev in seeded[:3]]
+            yield {"type": "final", "text": body, "sources": src}
+            return
+
     # 列舉題：用 list_subitems 的權威完整清單作答（不經會漏項的 RAG 合成）。
     ql = question.lower()
     chosen = None
@@ -659,7 +829,9 @@ def run_agent(
     if chosen is None and len(structural_results) == 1 and structural_results[0].get("subitems"):
         chosen = structural_results[0]
     # 確定性 fallback：即使這一輪 LLM 沒呼叫 list_subitems，列舉題仍直接從問題字串解析實體並完整列舉。
-    if chosen is None and _looks_like_enumeration(question):
+    # 但「引用/取代/被…引用」這類關係題不算列舉（否則「MIL-DTL-901 被哪些 810H 方法引用」會被
+    # 誤判成「列 810H 的方法」）—— 交給後面的 section_lookup / 規範關係區塊處理。
+    if chosen is None and _looks_like_enumeration(question) and not _RELATION_RE.search(question):
         fb = agent_tools.run_tool(db, "list_subitems", {"name": question})
         if isinstance(fb, dict) and fb.get("subitems"):
             chosen = {
@@ -668,15 +840,23 @@ def run_agent(
                 "references": fb.get("references") or [],
             }
 
-    if chosen:
+    if chosen and not is_app:
         body, enum_sources = _build_enumeration_answer(db, chosen, rag_evidence, conversation_history)
         yield {"type": "final", "text": body, "sources": enum_sources}
         return
 
+    # 確定性：問句若明確點名某方法號（如「509.7 引用了哪些規範」），直接用該號做 section_lookup，
+    # 不信任 LLM 可能挑錯的方法（觀察到 509.7 的問題被 agent 解析成 510.7）。
+    qm = re.search(r"\b(\d{3}\.\d{1,2})\b", question)
+    if not is_app and qm and _RELATION_RE.search(question):
+        det = agent_tools.run_tool(db, "section_lookup", {"name": qm.group(1)})
+        if isinstance(det, dict) and det.get("referenced_standards"):
+            section_lookup_obs = det
+
     # KG ⊇ RAG：section_lookup 命中 → 答案 = 知識圖譜的權威外部規範清單（結構化、純 RAG 給不了）
     #          ＋ RAG 合成的內容（內部章節/程序性引用等）。Agent 模式作為 RAG 的超集，故兩者都納入。
     # KG 段以確定性方式產出（不靠 gemma4 合成，否則會被 RAG 片段蓋過而漏掉外部規範）。
-    if section_lookup_obs and section_lookup_obs.get("referenced_standards"):
+    if not is_app and section_lookup_obs and section_lookup_obs.get("referenced_standards"):
         nm = section_lookup_obs.get("name") or section_lookup_obs.get("matched")
         cite: Dict[str, set] = {}
         for item in (section_lookup_obs.get("by_section") or []):
@@ -703,6 +883,38 @@ def run_agent(
             except Exception as e:
                 logger.warning("section_lookup combined synthesis failed: %s", e)
             body = kg_block if not rag_part else f"{kg_block}\n\n── 補充（文件內容檢索）──\n{rag_part}"
+            src = rag_sources or [
+                {"document_id": ev.get("document_id"), "title": ev.get("title"),
+                 "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
+                for ev in seeded[:3]]
+            yield {"type": "final", "text": body, "sources": src}
+            return
+
+    # KG ⊇ RAG（規範類）：查過某規範(spec_lookup/spec_references/supersedes) → 用確定性「規範關係區塊」
+    # （版本家族 + 引用 + 被引用 + 版本取代）＋ RAG 補充。避免自由合成丟掉現有的圖譜邊。
+    spec_center = _pick_spec_center(spec_candidates, question)
+    # 確定性 fallback：關係題且問句點名某規範，但 agent 沒查到 → 從問句抽規範 id 直接建區塊
+    # （讓「MIL-DTL-901 被哪些方法引用」穩定走規範關係區塊）。
+    if spec_center is None and _RELATION_RE.search(question or ""):
+        from .. import models as _models
+        m = _SPEC_ID_RE.search(question or "")
+        if m:
+            cand = re.sub(r"\s+", "", m.group(1)).upper()
+            ent = db.query(_models.KGEntity).filter(_models.KGEntity.canonical_id == cand).first()
+            if ent and ent.type not in ("section", "method", "annex", "document"):
+                spec_center = ent.canonical_id
+    # 應用題（「我的設備該做哪些…」）不走 spec 區塊（只是提到某規範，不是在問它的關係）→ 交給合成。
+    if spec_center and not _APP_RE.search(question or ""):
+        spec_block = _build_spec_relation_block(db, spec_center)
+        if spec_block:
+            rag_part, rag_sources = None, []
+            try:
+                g, rag_sources, _n, _t = _grounded_synthesis(db, question, rag_evidence, kg_notes, conversation_history)
+                if g and g.strip():
+                    rag_part = g.strip()
+            except Exception as e:
+                logger.warning("spec-relation combined synthesis failed: %s", e)
+            body = spec_block if not rag_part else f"{spec_block}\n\n── 補充（文件內容檢索）──\n{rag_part}"
             src = rag_sources or [
                 {"document_id": ev.get("document_id"), "title": ev.get("title"),
                  "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}

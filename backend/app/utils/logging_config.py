@@ -103,6 +103,10 @@ def setup_logging(
     # Reduce noise from external libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("multipart").setLevel(logging.WARNING)
+    # pdfminer's LZW/CCITT decoders emit a DEBUG line per code — on large PDFs this
+    # produces millions of lines and can exhaust memory. Keep these quiet always.
+    for _noisy in ("pdfminer", "pdfplumber", "PIL", "fontTools", "fitz"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     return root_logger
 

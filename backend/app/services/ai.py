@@ -93,6 +93,7 @@ def _chat_with_ollama(
     model: Optional[str] = None,
     response_format: Optional[Any] = None,
     think: bool = False,
+    options: Optional[Dict[str, Any]] = None,
 ) -> str:
     import time
     client = get_client()
@@ -102,6 +103,7 @@ def _chat_with_ollama(
         model=model or settings.OLLAMA_LLM_MODEL,
         format=response_format,
         think=think,
+        options=options,
     )
     elapsed = time.time() - t0
     logger.info("_chat_with_ollama elapsed=%.1fs think=%s output_len=%d preview=%s",
@@ -686,7 +688,15 @@ def analyze_pdf_page_images_singleturn(
     return _chat_with_ollama(
         messages,
         model=settings.OLLAMA_VISION_MODEL or settings.OLLAMA_LLM_MODEL,
+        options={"num_ctx": _vl_num_ctx(len(images))},
     )
+
+
+def _vl_num_ctx(n_images: int) -> int:
+    """VL 多頁分析需要動態加大 context：每頁圖約 1100~1300 tokens，10 頁可達 ~11k，
+    若只用預設 8192 會 exceed_context_size。依圖片數放大（含答案生成餘裕），上限 32768。"""
+    need = 4096 + n_images * 1300
+    return min(32768, max(settings.OLLAMA_NUM_CTX, need))
 
 
 def analyze_pdf_page_images_stream(
@@ -764,7 +774,11 @@ def analyze_pdf_page_images_stream(
         {"role": "user", "content": composed, "images": images},
     ]
 
-    for delta in client.chat_stream(messages, model=settings.OLLAMA_VISION_MODEL or settings.OLLAMA_LLM_MODEL):
+    for delta in client.chat_stream(
+        messages,
+        model=settings.OLLAMA_VISION_MODEL or settings.OLLAMA_LLM_MODEL,
+        options={"num_ctx": _vl_num_ctx(len(images))},
+    ):
         yield delta
 
 
