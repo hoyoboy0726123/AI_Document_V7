@@ -2,6 +2,7 @@ import { Button, Collapse, List, Space, Tag, Timeline, Typography } from "antd";
 import { BulbOutlined, EyeOutlined, FileTextOutlined, RobotOutlined, ToolOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { MermaidBlock, TableWithChartButton, graphFromObservation, MiniKgGraph } from "./richContent";
 
 const { Text } = Typography;
 
@@ -14,11 +15,30 @@ const { Text } = Typography;
  */
 
 export const markdownComponents = {
-  table: ({ node, ...props }) => (
-    <div style={{ overflowX: "auto", marginBottom: 8 }}>
-      <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 14 }} {...props} />
+  // 表格包一層「轉圖表」按鈕（確定性 DOM 解析，數值欄達 2/3 才出現按鈕，零 LLM）
+  table: ({ children }) => (
+    <div style={{ marginBottom: 8 }}>
+      <TableWithChartButton
+        tableStyle={{ borderCollapse: "collapse", width: "100%", fontSize: 14 }}
+      >
+        {children}
+      </TableWithChartButton>
     </div>
   ),
+  // ```mermaid 圍籬 → 圖；語法炸掉回退原始碼。react-markdown v9 的區塊碼包在
+  // <pre> 裡，攔 pre 才能避免 MermaidBlock 被包進 <pre> 破版
+  pre: ({ node, children, ...props }) => {
+    const child = Array.isArray(children) ? children[0] : children;
+    const cls = child?.props?.className || "";
+    if (/language-mermaid/.test(cls)) {
+      return <MermaidBlock code={String(child.props.children ?? "").trim()} />;
+    }
+    return (
+      <pre style={{ overflowX: "auto", background: "#fafafa", padding: 8, borderRadius: 6 }} {...props}>
+        {children}
+      </pre>
+    );
+  },
   thead: ({ node, ...props }) => <thead style={{ background: "#fafafa" }} {...props} />,
   th: ({ node, ...props }) => (
     <th style={{ border: "1px solid #d9d9d9", padding: "6px 12px", fontWeight: 600, textAlign: "left", whiteSpace: "nowrap" }} {...props} />
@@ -119,12 +139,16 @@ export const renderAgentSteps = (steps, isLive) => {
       }
       const outStr = JSON.stringify(s.output || {}, null, 2);
       const preview = outStr.length > 400 ? outStr.slice(0, 400) + "..." : outStr;
+      // KG 工具的圖資料直接畫小圖（引用網/版本鏈）—— 資料早就到了前端，
+      // 之前只用 JSON 純文字呈現，等於白白浪費一張現成的圖
+      const graph = graphFromObservation(s.output);
       return {
         color: "green",
         dot: <EyeOutlined style={{ fontSize: 14 }} />,
         children: (
           <div>
             <Text strong style={{ fontSize: 12, color: "#52c41a" }}>觀察 ({s.tool})</Text>
+            {graph && <div style={{ marginTop: 6 }}><MiniKgGraph data={graph} /></div>}
             <pre style={{ fontSize: 11, background: "#f6ffed", padding: 6, borderRadius: 4, overflow: "auto", maxHeight: 200, marginTop: 4 }}>
               {preview}
             </pre>
