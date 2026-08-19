@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-echo [Launcher] AI_Document_V6 - production mode (single port 8001, LAN accessible)
+echo [Launcher] AI_Document_V7 - production mode (single port 8001, LAN accessible)
 echo.
 
 REM ---------------------------------------------------------------------------
@@ -25,9 +25,10 @@ if not exist "backend\frontend_dist\index.html" (
     exit /b 1
 )
 
-REM OLLAMA_NUM_CTX: env var takes priority over .env; 8192 context window.
 REM OLLAMA_TIMEOUT: large models are slow to cold-load / swap; avoid timeouts.
-set OLLAMA_NUM_CTX=8192
+REM (OLLAMA_NUM_CTX intentionally NOT set here: env var would override .env.
+REM  This machine runs 24576 in .env; a hardcoded 8192 silently shrank the
+REM  RAG context budget. Configure ctx in backend\.env only.)
 set OLLAMA_TIMEOUT=300
 
 echo   Local: http://127.0.0.1:8001
