@@ -2,7 +2,8 @@ import { Button, Collapse, List, Space, Tag, Timeline, Typography } from "antd";
 import { BulbOutlined, EyeOutlined, FileTextOutlined, RobotOutlined, ToolOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { MermaidBlock, TableWithChartButton, graphFromObservation, MiniKgGraph } from "./richContent";
+import { MermaidBlock, TableWithChartButton, MiniKgGraph } from "./richContent";
+import { graphFromObservation } from "./kgGraphData";
 
 const { Text } = Typography;
 

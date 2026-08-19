@@ -1,7 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Spin, Typography } from "antd";
-import { graphFromObservation } from "./kgGraphData";
-export { graphFromObservation };
 import { BarChartOutlined } from "@ant-design/icons";
 
 const { Text } = Typography;
@@ -91,7 +89,7 @@ export const MermaidBlock = ({ code }) => {
 // 整格必須「就是一個數值」（可帶±、範圍前綴與短單位字尾）才算數據。
 // 實測教訓：說明欄散文裡的【來源6】、±2.5% 會被寬鬆抽取撈成數據，
 // 畫出 6,6,6,2.5 的長條圖 —— 純垃圾。散文嵌數字一律不算。
-const _CELL_NUM_RE = /^[-+±≦≧<>約~\s]*(-?\d[\d,]*(?:\.\d+)?)\s*(?:[a-zA-Z°%µ/·.\-]{0,10}|小時|分鐘|秒|次|天|個|項)?\s*$/;
+const _CELL_NUM_RE = /^[-+±≦≧<>約~\s]*(-?\d[\d,]*(?:\.\d+)?)\s*(?:[a-zA-Z°%µ/·.-]{0,10}|小時|分鐘|秒|次|天|個|項)?\s*$/;
 const _UNIT_HINT_RE = /°C|°F|℃|℉|%|m\/s|km\/h|Hz|kHz|dB|kPa|MPa|psi|\bg\b|kg|mg|mm|cm|\bm\b|in\b|ft\b|min|hr|hours?|sec|ms\b|[VAW]\b|小時|分鐘|秒|溫度|濕度|速度|壓力|高度|重量|時間|頻率|加速度/i;
 
 const parseTableEl = (tableEl) => {
