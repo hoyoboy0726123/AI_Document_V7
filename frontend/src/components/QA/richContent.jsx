@@ -32,6 +32,16 @@ const loadMermaid = () => {
 
 let _mermaidSeq = 0;
 
+// LLM 生成的 mermaid 最常見的死法：節點標籤裡帶 ASCII 括號/百分比/度數
+// （「100 mm (4 in.)」「±2.5 %」），未加引號的標籤遇到 () 就是語法錯誤。
+// 確定性硬化：把 [标签]、{标签}、|邊標籤| 一律補上雙引號 —— 引號內幾乎
+// 什麼字元都合法。已含引號的標籤跳過，不會二次包裝。
+const hardenMermaid = (code) =>
+  code
+    .replace(/\[([^[\]"\n]+)\]/g, (m, inner) => `["${inner.replace(/"/g, "'")}"]`)
+    .replace(/\{([^{}"\n]+)\}/g, (m, inner) => `{"${inner.replace(/"/g, "'")}"}`)
+    .replace(/\|([^|"\n]+)\|/g, (m, inner) => `|"${inner.replace(/"/g, "'")}"|`);
+
 export const MermaidBlock = ({ code }) => {
   const [svg, setSvg] = useState("");
   const [failed, setFailed] = useState(false);
@@ -43,8 +53,14 @@ export const MermaidBlock = ({ code }) => {
     const t = setTimeout(async () => {
       try {
         const mermaid = await loadMermaid();
-        await mermaid.parse(code);            // 先語法預檢，失敗不進 render
-        const { svg: out } = await mermaid.render(`mmd-${++_mermaidSeq}`, code);
+        let src = hardenMermaid(code);
+        try {
+          await mermaid.parse(src);           // 先語法預檢，失敗不進 render
+        } catch {
+          src = code;                          // 硬化反而弄壞冷門語法時退回原文再試
+          await mermaid.parse(src);
+        }
+        const { svg: out } = await mermaid.render(`mmd-${++_mermaidSeq}`, src);
         if (!dead) setSvg(out);
       } catch {
         if (!dead) { setFailed(true); setSvg(""); }
