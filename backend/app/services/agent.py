@@ -1587,6 +1587,61 @@ def _build_spec_relation_block(db: Session, canonical_id: str) -> Optional[str]:
     return f"**{cid}** 的規範關係（依知識圖譜，非向量檢索）：\n\n" + "\n".join(f"- {ln}" for ln in lines)
 
 
+def _spec_relation_graph(db: Session, canonical_id: str) -> Optional[Dict[str, Any]]:
+    """關係題的圖資料（與 _build_spec_relation_block 同源查詢）：版本鏈 + 引用網。
+
+    為什麼另外給圖：關聯題走確定性提前出口，不產生 ReAct 觀察步驟，
+    前端的觀察小圖掛不到 —— 圖資料由 final 事件直接帶出去。
+    節點上限刻意收緊（outgoing 20 / incoming 12），力導向圖超過 40 節點就是毛球。
+    """
+    from .. import models
+    ent = db.query(models.KGEntity).filter_by(canonical_id=canonical_id).first()
+    if not ent:
+        return None
+    cid = ent.canonical_id
+    nodes: Dict[str, Dict[str, Any]] = {cid: {"id": cid, "main": True}}
+    links: List[Dict[str, Any]] = []
+
+    base = re.sub(r"(?<=\d)[A-Z]$", "", cid)
+    fam_pat = re.compile("^" + re.escape(base) + r"[A-Z]?$")
+    fam = sorted({e.canonical_id for e in db.query(models.KGEntity)
+                  .filter(models.KGEntity.canonical_id.like(base + "%")).all()
+                  if fam_pat.match(e.canonical_id or "")})
+    if len(fam) > 1:
+        for a, b in zip(fam, fam[1:]):
+            nodes.setdefault(a, {"id": a})
+            nodes.setdefault(b, {"id": b})
+            links.append({"source": b, "target": a, "rel": "supersedes"})
+
+    n_out = 0
+    for r in db.query(models.KGRelation).filter_by(src_id=ent.id, rel_type="references").all():
+        t = db.query(models.KGEntity).filter_by(id=r.dst_id).first()
+        if not t or t.type in ("section", "method", "annex", "document") or t.canonical_id == cid:
+            continue
+        if n_out >= 20:
+            break
+        nodes.setdefault(t.canonical_id, {"id": t.canonical_id})
+        links.append({"source": cid, "target": t.canonical_id, "rel": "references"})
+        n_out += 1
+
+    n_in = 0
+    for r in db.query(models.KGRelation).filter_by(dst_id=ent.id, rel_type="references").all():
+        srcv = db.query(models.KGEntity).filter_by(id=r.src_id).first()
+        if not srcv or srcv.canonical_id == cid or (srcv.canonical_id or "").startswith("doc:"):
+            continue
+        if (srcv.canonical_id or "").startswith(base):
+            continue
+        if n_in >= 12:
+            break
+        nodes.setdefault(srcv.canonical_id, {"id": srcv.canonical_id})
+        links.append({"source": srcv.canonical_id, "target": cid, "rel": "references"})
+        n_in += 1
+
+    if len(links) < 2:
+        return None
+    return {"nodes": list(nodes.values()), "links": links}
+
+
 _OVERVIEW_RE = re.compile(
     r"(介紹|說明|概覽|概述|描述|重點|摘要|整理|內容|overview|brief|describe|summar|"
     r"tell me about|rundown|walk me through|各[項個種子]|每[項個種]|each\b|"
@@ -1927,7 +1982,8 @@ def _build_enumeration_answer(db: Session, chosen: Dict[str, Any], rag_evidence,
 
 def _emit_final(db: Session, question: str, text: str,
                 sources: Optional[List[Dict[str, Any]]],
-                fallback_evidence: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                fallback_evidence: Optional[List[Dict[str, Any]]] = None,
+                kg_graph: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """所有「產出最終答案」的出口都必須經過這裡。
 
     run_agent 有 9 個 yield final 的地方，先前只有末端那一個做了完整處理
@@ -1963,7 +2019,10 @@ def _emit_final(db: Session, question: str, text: str,
                 "page": ev.get("page"), "snippet": ev.get("snippet"),
                 "score": ev.get("score")} for ev in fallback_evidence[:5]]
 
-    return {"type": "final", "text": txt, "sources": src}
+    out = {"type": "final", "text": txt, "sources": src}
+    if kg_graph:
+        out["kg_graph"] = kg_graph   # 關聯題的引用網/版本鏈，前端畫力導向小圖
+    return out
 
 
 def run_agent(
@@ -2075,7 +2134,8 @@ def run_agent(
                     _body = _blk if not _rag_part else (
                         f"{_blk}\n\n── 補充（文件內容檢索）──\n{_rag_part}"
                     )
-                    yield _emit_final(db, question, _body, _rag_src, seeded)
+                    yield _emit_final(db, question, _body, _rag_src, seeded,
+                                      kg_graph=_spec_relation_graph(db, _ent.canonical_id))
                     return
 
     # 純列舉題（「有哪些子項目 / 列出全部」且非規格/判定/目的等細節面向）→ 直接用 KG 確定性完整列舉。
@@ -2572,7 +2632,8 @@ def run_agent(
                 {"document_id": ev.get("document_id"), "title": ev.get("title"),
                  "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
                 for ev in seeded[:3]]
-            yield _emit_final(db, question, body, src, seeded)
+            yield _emit_final(db, question, body, src, seeded,
+                              kg_graph=_spec_relation_graph(db, spec_center))
             return
 
     # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。

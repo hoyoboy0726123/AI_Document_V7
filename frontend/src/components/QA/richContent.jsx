@@ -72,23 +72,43 @@ export const MermaidBlock = ({ code }) => {
 
 // ── 表格轉圖表（opt-in 按鈕，確定性解析，零 LLM） ──────────────────────────
 
+// 整格必須「就是一個數值」（可帶±、範圍前綴與短單位字尾）才算數據。
+// 實測教訓：說明欄散文裡的【來源6】、±2.5% 會被寬鬆抽取撈成數據，
+// 畫出 6,6,6,2.5 的長條圖 —— 純垃圾。散文嵌數字一律不算。
+const _CELL_NUM_RE = /^[-+±≦≧<>約~\s]*(-?\d[\d,]*(?:\.\d+)?)\s*(?:[a-zA-Z°%µ/·.\-]{0,10}|小時|分鐘|秒|次|天|個|項)?\s*$/;
+const _UNIT_HINT_RE = /°C|°F|℃|℉|%|m\/s|km\/h|Hz|kHz|dB|kPa|MPa|psi|\bg\b|kg|mg|mm|cm|\bm\b|in\b|ft\b|min|hr|hours?|sec|ms\b|[VAW]\b|小時|分鐘|秒|溫度|濕度|速度|壓力|高度|重量|時間|頻率|加速度/i;
+
 const parseTableEl = (tableEl) => {
   if (!tableEl) return null;
   const headers = [...tableEl.querySelectorAll("thead th")].map((th) => th.textContent.trim());
   const rows = [...tableEl.querySelectorAll("tbody tr")].map((tr) =>
     [...tr.querySelectorAll("td")].map((td) => td.textContent.trim()));
-  if (headers.length < 2 || rows.length < 2) return null;
-  // 找數值欄：該欄至少 2/3 的儲存格能抽出數字（容忍單位字尾，如 "15 m/s"、"-51°C"）
+  if (headers.length < 2 || rows.length < 3) return null;
   const numOf = (s) => {
-    const m = String(s).replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
-    return m ? parseFloat(m[0]) : null;
+    const cell = String(s || "").trim();
+    if (!cell || cell.length > 20) return null;          // 長格＝散文，不是數值
+    const m = cell.match(_CELL_NUM_RE);
+    return m ? parseFloat(m[1].replace(/,/g, "")) : null;
   };
   const numericCols = [];
   for (let c = 1; c < headers.length; c += 1) {
-    const nums = rows.map((r) => numOf(r[c]));
-    if (nums.filter((v) => v !== null).length >= Math.ceil(rows.length * 2 / 3)) {
-      numericCols.push({ index: c, values: nums });
+    const cells = rows.map((r) => r[c] ?? "");
+    const nums = cells.map(numOf);
+    const valid = nums.filter((v) => v !== null);
+    if (valid.length < Math.max(3, Math.ceil(rows.length * 2 / 3))) continue;
+    // 代號/流水號排除：全整數且近乎等差（01,02,03… / 頁碼）不是量值
+    const ints = valid.every((v) => Number.isInteger(v));
+    if (ints) {
+      const sorted = [...valid].sort((a, b) => a - b);
+      const seqLike = sorted.every((v, i) => i === 0 || v - sorted[i - 1] <= 2);
+      const zeroPadded = cells.some((s) => /^0\d/.test(s.trim()));
+      if (seqLike || zeroPadded) continue;
     }
+    // 量值證據：表頭或儲存格帶單位；沒有單位就要求有小數/負數（避免任意整數欄）
+    const hasUnit = _UNIT_HINT_RE.test(headers[c] || "") || cells.some((s) => _UNIT_HINT_RE.test(s));
+    const hasQuantityShape = valid.some((v) => !Number.isInteger(v) || v < 0);
+    if (!hasUnit && !hasQuantityShape) continue;
+    numericCols.push({ index: c, values: nums });
   }
   if (!numericCols.length) return null;
   return {

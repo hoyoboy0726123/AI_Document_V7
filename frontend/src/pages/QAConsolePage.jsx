@@ -431,7 +431,7 @@ const QAConsolePage = () => {
           } : null);
         },
         onFinal: (data) => {
-          setStreaming((prev) => prev ? { ...prev, answer: data.text || "", sources: data.sources || [], thinkingDone: true, sourcesPreliminary: false } : null);
+          setStreaming((prev) => prev ? { ...prev, answer: data.text || "", sources: data.sources || [], kg_graph: data.kg_graph || null, thinkingDone: true, sourcesPreliminary: false } : null);
         },
         onDone: (doneEvt) => {
           syncConversationId(doneEvt);
@@ -441,6 +441,7 @@ const QAConsolePage = () => {
               question: prev.question,
               answer: prev.answer,
               sources: prev.sources || [],
+              kg_graph: prev.kg_graph || null,
               // 用後端回報的實際改寫結果，而不是前端送出的旗標 ——
               // 那個旗標現在恆為 true（一律送完整歷史由後端判斷），
               // 照它顯示會讓新對話的第一題也被標成「追問」。
@@ -513,6 +514,7 @@ const QAConsolePage = () => {
             ...prev,
             answer: data.text || "",
             sources: data.sources || [],
+            kg_graph: data.kg_graph || null,
             optimized_query: data.rewritten ? (data.optimized_query || null) : null,
             thinkingDone: true,
             sourcesPreliminary: false,
@@ -524,6 +526,7 @@ const QAConsolePage = () => {
           if (prev) {
             const newMsg = {
               question: prev.question, answer: prev.answer, sources: prev.sources || [],
+              kg_graph: prev.kg_graph || null,
               // is_followup 必須用後端回報的實際改寫結果：前端那個旗標現在恆為
               // true（一律送完整歷史由後端判斷），照它顯示會讓新對話的第一題
               // 也被標成「追問」。

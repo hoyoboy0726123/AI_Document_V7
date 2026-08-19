@@ -60,6 +60,7 @@ def agent_chat(
             )
             final_text = ""
             final_sources = []
+            final_kg_graph = None
             for evt in agent.run_agent(
                 db,
                 question,
@@ -70,7 +71,9 @@ def agent_chat(
                 if etype == "final":
                     final_text = evt.get("text") or ""
                     final_sources = evt.get("sources") or []
-                    yield _sse("final", {"text": final_text, "sources": final_sources})
+                    final_kg_graph = evt.get("kg_graph")
+                    yield _sse("final", {"text": final_text, "sources": final_sources,
+                                         "kg_graph": final_kg_graph})
                 elif etype == "error":
                     yield _sse("error", {"message": evt.get("message")})
                 else:
@@ -82,6 +85,7 @@ def agent_chat(
                 db, user_id, conversation_id,
                 question=question, answer=final_text,
                 sources=final_sources, mode="agent",
+                kg_graph=final_kg_graph,
             )
             # 回報這次有沒有承接前文（見 agent.remember_resolved）——
             # 前端的「追問」標籤要照這個顯示，而不是照它自己送出的旗標。
@@ -140,6 +144,7 @@ def agent_route(
             )
             yield _sse("route", {"mode": mode})
             final_text, final_sources = "", []
+            final_kg_graph = None
             meta: Dict[str, Any] = {}    # rag 分支填入改寫結果；agent 分支保持空
             if mode == "agent":
                 for evt in agent.run_agent(db, question, conversation_history=history, max_steps=max_steps):
@@ -147,7 +152,9 @@ def agent_route(
                     if etype == "final":
                         final_text = evt.get("text") or ""
                         final_sources = evt.get("sources") or []
-                        yield _sse("final", {"text": final_text, "sources": final_sources})
+                        final_kg_graph = evt.get("kg_graph")
+                        yield _sse("final", {"text": final_text, "sources": final_sources,
+                                             "kg_graph": final_kg_graph})
                     elif etype == "error":
                         yield _sse("error", {"message": evt.get("message")})
                     else:
@@ -175,6 +182,7 @@ def agent_route(
                 db, user_id, conversation_id,
                 question=question, answer=final_text,
                 sources=final_sources, mode=f"hybrid:{mode}",
+                kg_graph=final_kg_graph,
                 optimized_query=(meta.get("optimized_query")
                                  if mode == "rag" and meta.get("rewritten") else None),
                 is_followup=bool(history),

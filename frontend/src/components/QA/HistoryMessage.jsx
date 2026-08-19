@@ -4,6 +4,7 @@ import { SaveOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { markdownComponents, renderAgentSteps, renderSources, renderThinking } from "./messageParts";
+import { MiniKgGraph } from "./richContent";
 
 const { Text } = Typography;
 
@@ -86,6 +87,7 @@ const HistoryMessage = memo(function HistoryMessage({
             {msg.answer}
           </ReactMarkdown>
         </div>
+        {msg.kg_graph && <div style={{ marginTop: 8 }}><MiniKgGraph data={msg.kg_graph} /></div>}
         {renderSources(msg.sources, index, expandedSnippets, onToggleSnippet, onPreviewPdf)}
         {msg.sources?.length > 0 && (
           <div style={{ marginTop: 12, textAlign: "right" }}>
