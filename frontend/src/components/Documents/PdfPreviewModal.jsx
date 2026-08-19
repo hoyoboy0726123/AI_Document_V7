@@ -21,12 +21,30 @@ const PdfPreviewModal = ({
   title,
   initialPage = 1,
   initialHighlightKeyword = "",
+  highlightSnippet = "",
   onClose,
 }) => {
   const { token } = useAuthStore();
   const [numPages, setNumPages] = useState(null);
   const [pageNumber, setPageNumber] = useState(initialPage || 1);
   const [scale, setScale] = useState(1.15);
+  // 引用溯源高亮：後端 locate 回傳 PDF point 座標框，前端量實際渲染寬度換算。
+  // 文字型走文字層搜尋（毫秒）、圖片型現場 OCR 該頁（~4-8 秒）——框晚到就晚畫。
+  const [locateData, setLocateData] = useState(null);
+  const [renderedPageW, setRenderedPageW] = useState(0);
+  const pageWrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!open || !documentId || !highlightSnippet) { setLocateData(null); return undefined; }
+    let cancelled = false;
+    setLocateData(null);
+    apiClient
+      .post(`documents/${documentId}/page/${pageNumber}/locate`,
+        { snippet: highlightSnippet }, { timeout: 60000 })
+      .then((r) => { if (!cancelled) setLocateData(r.data); })
+      .catch(() => { if (!cancelled) setLocateData(null); });
+    return () => { cancelled = true; };
+  }, [open, documentId, pageNumber, highlightSnippet]);
 
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -724,13 +742,39 @@ const PdfPreviewModal = ({
               }}
             >
               <Document file={fileUrl} onLoadSuccess={handleLoadSuccess} loading={fileLoading}>
-                <Page
-                  pageNumber={pageNumber}
-                  scale={scale}
-                  loading={fileLoading}
-                  renderTextLayer
-                  renderAnnotationLayer={false}
-                />
+                <div ref={pageWrapRef} style={{ position: "relative", display: "inline-block" }}>
+                  <Page
+                    pageNumber={pageNumber}
+                    scale={scale}
+                    loading={fileLoading}
+                    renderTextLayer
+                    renderAnnotationLayer={false}
+                    onRenderSuccess={() => {
+                      const canvas = pageWrapRef.current?.querySelector("canvas");
+                      setRenderedPageW(canvas ? canvas.clientWidth : 0);
+                    }}
+                  />
+                  {locateData?.rects?.length > 0 && renderedPageW > 0 && locateData.page_width > 0 &&
+                    locateData.rects.map((r, i) => {
+                      const k = renderedPageW / locateData.page_width;
+                      return (
+                        <div
+                          key={i}
+                          style={{
+                            position: "absolute",
+                            left: r.x0 * k,
+                            top: r.y0 * k,
+                            width: Math.max(2, (r.x1 - r.x0) * k),
+                            height: Math.max(2, (r.y1 - r.y0) * k),
+                            background: "rgba(255, 213, 0, 0.35)",
+                            outline: "1.5px solid rgba(250, 140, 22, 0.85)",
+                            borderRadius: 2,
+                            pointerEvents: "none",
+                          }}
+                        />
+                      );
+                    })}
+                </div>
               </Document>
             </div>
           </div>

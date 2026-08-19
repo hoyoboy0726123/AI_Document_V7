@@ -830,6 +830,32 @@ async def upload_pdf_async(
     return bg_task
 
 
+@router.post("/{document_id}/page/{page_number}/locate")
+def locate_snippet_on_page(
+    document_id: str,
+    page_number: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """引用溯源定位：回傳 snippet 在該頁的座標框（PDF point 座標系）。
+
+    文字型 PDF 走 PyMuPDF 搜尋（毫秒級）；圖片型現場對該頁跑一次
+    RapidOCR（~4 秒）取行級座標。前端在渲染頁面上疊半透明高亮框。
+    """
+    snippet = str((body or {}).get("snippet") or "").strip()
+    if not snippet:
+        raise HTTPException(status_code=400, detail="snippet 不可為空")
+    doc_service = _doc_service(db)
+    document = _get_document_or_404(doc_service, document_id)
+    if not document.pdf_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF 尚未上傳或已被移除")
+    validated_path = validate_file_path(
+        file_path=document.pdf_path, base_dir=settings.FILE_STORAGE_DIR)
+    from ...services import pdf_locate
+    return pdf_locate.locate(str(validated_path), page_number, snippet)
+
+
 @router.get("/{document_id}/pdf")
 def download_document_pdf(
     document_id: str,

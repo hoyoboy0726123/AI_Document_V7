@@ -702,7 +702,9 @@ const QAConsolePage = () => {
   // 它們只呼叫 setState（setState 本身是穩定的），所以相依可以是空陣列。
   const openPdfPreview = useCallback((source) => {
     const page = source.page && source.page > 0 ? source.page : 1;
-    setPdfPreview({ open: true, documentId: source.document_id, title: source.title, page });
+    // snippet 帶給預覽視窗做引用溯源高亮（後端 locate 座標框，兩型 PDF 通吃）
+    setPdfPreview({ open: true, documentId: source.document_id, title: source.title,
+                    page, snippet: source.snippet || "" });
   }, []);
 
   const toggleSnippet = useCallback((key) => {
@@ -1123,7 +1125,8 @@ const QAConsolePage = () => {
         documentId={pdfPreview.documentId}
         title={pdfPreview.title}
         initialPage={pdfPreview.page}
-        onClose={() => setPdfPreview({ open: false, documentId: null, title: "", page: 1 })}
+        highlightSnippet={pdfPreview.snippet || ""}
+        onClose={() => setPdfPreview({ open: false, documentId: null, title: "", page: 1, snippet: "" })}
       />
     </AppLayout>
   );
