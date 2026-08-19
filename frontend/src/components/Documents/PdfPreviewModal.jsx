@@ -29,22 +29,34 @@ const PdfPreviewModal = ({
   const [pageNumber, setPageNumber] = useState(initialPage || 1);
   const [scale, setScale] = useState(1.15);
   // 引用溯源高亮：後端 locate 回傳 PDF point 座標框，前端量實際渲染寬度換算。
-  // 文字型走文字層搜尋（毫秒）、圖片型現場 OCR 該頁（~4-8 秒）——框晚到就晚畫。
+  // 「預設關閉、手動開啟」：圖片型 PDF 的定位要現場 OCR（~4-8 秒），
+  // 每次開預覽都自動跑會拖慢進場，而使用者不是每次都要查證位置。
+  const [highlightOn, setHighlightOn] = useState(false);
+  const [locating, setLocating] = useState(false);
   const [locateData, setLocateData] = useState(null);
   const [renderedPageW, setRenderedPageW] = useState(0);
   const pageWrapRef = useRef(null);
 
   useEffect(() => {
-    if (!open || !documentId || !highlightSnippet) { setLocateData(null); return undefined; }
+    if (open) { setHighlightOn(false); setLocateData(null); }   // 每次開啟都回到預設關
+  }, [open, documentId]);
+
+  useEffect(() => {
+    if (!open || !documentId || !highlightSnippet || !highlightOn) {
+      setLocateData(null);
+      return undefined;
+    }
     let cancelled = false;
     setLocateData(null);
+    setLocating(true);
     apiClient
       .post(`documents/${documentId}/page/${pageNumber}/locate`,
         { snippet: highlightSnippet }, { timeout: 60000 })
       .then((r) => { if (!cancelled) setLocateData(r.data); })
-      .catch(() => { if (!cancelled) setLocateData(null); });
+      .catch(() => { if (!cancelled) setLocateData(null); })
+      .finally(() => { if (!cancelled) setLocating(false); });
     return () => { cancelled = true; };
-  }, [open, documentId, pageNumber, highlightSnippet]);
+  }, [open, documentId, pageNumber, highlightSnippet, highlightOn]);
 
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -627,6 +639,15 @@ const PdfPreviewModal = ({
             <Space style={{ marginBottom: 12 }} wrap>
               <Button icon={<MinusOutlined />} onClick={() => handleZoom(-0.15)} />
               <Button icon={<PlusOutlined />} onClick={() => handleZoom(0.15)} />
+              {highlightSnippet && (
+                <Button
+                  type={highlightOn ? "primary" : "default"}
+                  loading={locating}
+                  onClick={() => setHighlightOn((v) => !v)}
+                >
+                  {highlightOn ? "隱藏引用標示" : "標示引用位置"}
+                </Button>
+              )}
               <Button icon={<LeftOutlined />} onClick={() => changePage(-1)} disabled={pageNumber <= 1}>
                 上一頁
               </Button>
