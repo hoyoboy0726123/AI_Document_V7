@@ -1642,6 +1642,17 @@ def _spec_relation_graph(db: Session, canonical_id: str) -> Optional[Dict[str, A
     return {"nodes": list(nodes.values()), "links": links}
 
 
+def _containment_graph(center: str, children: List[str],
+                       rel: str = "contains", cap: int = 30) -> Optional[Dict[str, Any]]:
+    """列舉/程序題的星狀圖：母節點 contains 各子項。子項太多畫成毛球，超過 cap 截斷。"""
+    kids = [c for c in children if c][:cap]
+    if not center or len(kids) < 2:
+        return None
+    nodes = [{"id": center, "main": True}] + [{"id": k} for k in kids]
+    links = [{"source": center, "target": k, "rel": rel} for k in kids]
+    return {"nodes": nodes, "links": links}
+
+
 _OVERVIEW_RE = re.compile(
     r"(介紹|說明|概覽|概述|描述|重點|摘要|整理|內容|overview|brief|describe|summar|"
     r"tell me about|rundown|walk me through|各[項個種子]|每[項個種]|each\b|"
@@ -2169,7 +2180,9 @@ def run_agent(
                  "references": fb.get("references") or []},
                 None, conversation_history,
             )
-            yield _emit_final(db, question, body, esrc, seeded)
+            _eg = _containment_graph(
+                str(fb.get("matched")), [x.get("name") or x.get("number") or "" for x in fb["subitems"]])
+            yield _emit_final(db, question, body, esrc, seeded, kg_graph=_eg)
             return
 
     # 程序題（有哪些／有幾個程序）提前出口：用 list_procedures 的權威掃描直接作答。
@@ -2211,7 +2224,10 @@ def run_agent(
                 {"document_id": ev.get("document_id"), "title": ev.get("title"),
                  "page": ev.get("page"), "snippet": ev.get("snippet"), "score": ev.get("score")}
                 for ev in (_pseed or [])[:3]]
-            yield _emit_final(db, question, body, src, _pseed or [])
+            _pg = _containment_graph(
+                str(head), [f"Proc {p['procedure']}" + (f" {p.get('title')}" if p.get("title") else "")
+                            for p in pr["procedures"]])
+            yield _emit_final(db, question, body, src, _pseed or [], kg_graph=_pg)
             return
 
     # 結構性問題（逐項細節 / 概覽）：用 KG 把「全部子項內容」撈齊(保證完整、含關鍵字漏撈的子項)，
@@ -2537,7 +2553,9 @@ def run_agent(
 
     if chosen and not is_app:
         body, enum_sources = _build_enumeration_answer(db, chosen, rag_evidence, conversation_history)
-        yield _emit_final(db, question, body, enum_sources, seeded)
+        _eg2 = _containment_graph(
+            str(chosen.get("matched")), [x.get("name") or x.get("number") or "" for x in chosen["subitems"]])
+        yield _emit_final(db, question, body, enum_sources, seeded, kg_graph=_eg2)
         return
 
     # 確定性：問句若明確點名某方法號（如「509.7 引用了哪些規範」），直接用該號做 section_lookup，
