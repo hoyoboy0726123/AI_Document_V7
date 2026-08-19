@@ -199,6 +199,7 @@ const REL_COLORS = {
 
 export const MiniKgGraph = ({ data }) => {
   const wrapRef = useRef(null);
+  const fgRef = useRef(null);
   const [w, setW] = useState(0);
   useEffect(() => {
     const el = wrapRef.current;
@@ -209,26 +210,51 @@ export const MiniKgGraph = ({ data }) => {
     return () => ro.disconnect();
   }, []);
   return (
-    <div ref={wrapRef} style={{ width: "100%", height: 260, border: "1px solid #f0f0f0",
+    <div ref={wrapRef} style={{ width: "100%", height: 300, border: "1px solid #f0f0f0",
                                 borderRadius: 6, overflow: "hidden", background: "#fff" }}>
       {w > 0 && (
         <Suspense fallback={<Spin style={{ margin: 24 }} />}>
           <ForceGraph2D
+            ref={fgRef}
             graphData={data}
             width={w}
-            height={258}
+            height={298}
             nodeLabel="id"
-            nodeColor={(n) => (n.main ? "#fa8c16" : "#1677ff")}
-            nodeRelSize={5}
+            nodeRelSize={4}
+            // 標籤直接畫在 canvas 上 —— 只靠 hover 提示的話，整張圖就是
+            // 一團無資訊量的藍點（實測使用者直接回報「不正常」）
+            nodeCanvasObject={(node, ctx, globalScale) => {
+              const r = node.main ? 6 : 4;
+              ctx.beginPath();
+              ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+              ctx.fillStyle = node.main ? "#fa8c16" : "#1677ff";
+              ctx.fill();
+              const label = String(node.id).length > 22
+                ? `${String(node.id).slice(0, 21)}…` : String(node.id);
+              const fs = Math.max(10 / globalScale, 2.6);
+              ctx.font = `${node.main ? "bold " : ""}${fs}px sans-serif`;
+              ctx.textAlign = "center";
+              ctx.textBaseline = "top";
+              ctx.fillStyle = "#333";
+              ctx.fillText(label, node.x, node.y + r + 1.5);
+            }}
+            nodePointerAreaPaint={(node, color, ctx) => {
+              ctx.beginPath();
+              ctx.arc(node.x, node.y, 8, 0, 2 * Math.PI);
+              ctx.fillStyle = color;
+              ctx.fill();
+            }}
             linkColor={(l) => REL_COLORS[l.rel] || "#bfbfbf"}
-            linkDirectionalArrowLength={4}
+            linkDirectionalArrowLength={3.5}
             linkLabel={(l) => l.rel || ""}
             cooldownTicks={90}
+            // 佈局收斂後自動縮放到全圖可見 —— 沒有這個，版本鏈長尾直接跑出視窗
+            onEngineStop={() => fgRef.current?.zoomToFit(300, 28)}
           />
         </Suspense>
       )}
       <Text type="secondary" style={{ fontSize: 11, position: "relative", top: -22, left: 8 }}>
-        知識圖譜關聯（可拖曳）
+        知識圖譜關聯（可拖曳／滾輪縮放）
       </Text>
     </div>
   );

@@ -210,7 +210,10 @@ export const renderSources = (sources, msgIndex, expandedSnippets, onToggle, onP
                     <Tag color="green">來源 {idx + 1}</Tag>
                     <Text>{source.title || "(未命名文件)"}{typeof source.page === "number" ? ` - 第 ${source.page} 頁` : ""}</Text>
                     {source.score != null && (<Text type="secondary">(相似度 {source.score.toFixed(3)})</Text>)}
-                    <Button size="small" onClick={() => onPreview(source)}>預覽</Button>
+                    {/* 知識圖譜關聯這類合成來源沒有對應文件頁面，預覽按鈕沒意義 */}
+                    {source.document_id && (
+                      <Button size="small" onClick={() => onPreview(source)}>預覽</Button>
+                    )}
                   </Space>
                 }
                 description={
