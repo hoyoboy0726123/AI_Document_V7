@@ -58,7 +58,11 @@ class Settings(BaseSettings):
     # 答案末端才會頻繁出現「另有 N 段因長度限制未展開」。
     # 24GB VRAM 跑 qwen3:8b @ 24k 綽綽有餘。放寬後務必用評估確認長脈絡下
     # 生成品質沒有退化（長 context 可能出現「中間遺失」）。
-    OLLAMA_NUM_CTX: int | None = 24576
+    # 預設 8192：8GB VRAM 機器的安全值（qwen3:8b 實測 6.3GB；24576 要 8.7GB
+    # 會溢出）。高規格機器在 .env 調高（24GB 卡可設 24576）—— 預設值遷就
+    # 最小部署規格，而不是開發機。啟動腳本「不可」用環境變數硬塞這個值：
+    # 環境變數優先權高於 .env，會默默蓋掉使用者的機器專屬設定。
+    OLLAMA_NUM_CTX: int | None = 8192
     # 嵌入模型的 ctx 與 chat 分開設：qwen3-embedding:8b 若用模型預設 32768，
     # KV cache 讓它吃到 10GB —— 8GB 卡連單獨載入都不行，直接溢出到 CPU。
     # 降到 4096 只剩 6.6GB，且對嵌入值零影響（實測與預設 ctx 的 cosine =
