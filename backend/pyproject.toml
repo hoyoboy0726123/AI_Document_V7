@@ -58,6 +58,11 @@ dependencies = [
 
 [tool.uv]
 package = false
+# rapidocr/rapid-* 依賴 opencv-python（曾解析到 5.0），paddlex 鎖 opencv-contrib-python
+# ==4.10.0.84；兩個發行版共用 cv2/ 路徑，安裝時互相覆蓋，版本不同會造成包裝層與
+# 原生 .pyd 不一致 → rapid 與 paddle 的 OCR 全數 import 失敗（實機踩過）。
+# 只留 contrib（功能超集，可滿足 rapid 的 cv2 需求）：用永不成立的 marker 移除 opencv-python。
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
 
 # torch 一律從 PyTorch CPU index 取（跨平台都不抓 CUDA 版）。
 [tool.uv.sources]
