@@ -312,13 +312,26 @@ ollama pull qwen3-embedding:8b
 
 ### 2) 後端
 
+**方式 A：uv（建議）** — 依 `uv.lock` 精確還原全部依賴（含 torch CPU 版 index），一行完成：
+
+```bash
+# 沒有 uv 先裝：https://docs.astral.sh/uv/getting-started/installation/
+# Windows: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+cd backend
+uv sync                           # 自動建立 .venv 並依 lock 檔安裝
+
+copy .env_example .env            # 然後編輯 .env（見下方）
+uv run alembic upgrade head       # 套用資料庫遷移
+```
+
+**方式 B：pip**：
+
 ```bash
 cd backend
 python -m venv .venv
 .venv\Scripts\activate            # Windows CMD
-pip install -r requirements.txt   # 或 uv sync（若用 uv）
-                                  # 含 opencc-python-reimplemented：
-                                  # 答案的簡體→台灣正體轉換（Apache 2.0）
+pip install -r requirements.txt
 
 copy .env_example .env            # 然後編輯 .env（見下方）
 alembic upgrade head              # 套用資料庫遷移
