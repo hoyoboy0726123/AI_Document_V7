@@ -61,3 +61,4 @@ backend/doc_management.db.bak*
 # 切換 provider 時的本機 .env 備份
 backend/.env.bak*
 backend/doc_management.db.bak*
+backend/scripts/eval/
