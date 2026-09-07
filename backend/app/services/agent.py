@@ -1287,9 +1287,45 @@ _ENUM_RE = re.compile(
 )
 
 
+# 列舉詞的「內容題」否決（2026-09-07 評測回歸）：
+#   1. 計數詞後面接的是「量」而不是「項目」：「最少要幾個 24 小時週期」「幾度」「多少 kPa」——
+#      這是在問數值，不是在問清單。實測鹽霧週期題（Q03）被 list_subitems 攔截，
+#      回了 METHOD 509.7 的五個章節標題，持續時間完全沒答。
+#   2. 「有什麼」後面接的是內容名詞（要求/規定/限制/條件/影響…）：「對 USB-C 充電功率
+#      有什麼要求」是在問規範內容，不是在問子項目。實測語料外題（Q30）被同一路徑劫持，
+#      回了 29 個 Method 的清單，正確答案應是「查無」。
+_ENUM_CONTENT_GUARD_RE = re.compile(
+    # 注意：不能在中文單位後面放 \b —— 「小時週期」裡「時」「週」都是 \w，中間沒有字邊界，
+    # 加了 \b 整條就不會命中；\b 只套在英文單位上。
+    r"(幾個|幾種|幾類|多少個?)\s*[\d.,]*\s*"
+    r"(?:小時|天|週期|週|循環|次|度|秒|分鐘|分|公尺|公分|毫米|公里|公斤|克|%|％|°|℃|℉|"
+    r"(?:mm|cm|km|kg|kPa|psi|hz|khz|db|w/m|m/s|ft|lb|"
+    r"hours?|days?|weeks?|cycles?|periods?|minutes?|seconds?|times)\b)"
+    r"|有什麼\s*(要求|規定|規範|限制|條件|建議|影響|差異|差別|不同|特性|特點|注意|作用|功能|目的|意義|風險|標準|規格|定義)",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_enumeration(q: str) -> bool:
-    """判斷是否為列舉題（有哪些/列出/子項目…），用於確定性 KG 列舉 fallback。"""
-    return bool(_ENUM_RE.search(q or ""))
+    """判斷是否為列舉題（有哪些/列出/子項目…），用於確定性 KG 列舉 fallback。
+
+    計數詞接單位（「幾個 24 小時週期」）或「有什麼＋內容名詞」（「有什麼要求」）
+    是內容題，不算列舉（見 _ENUM_CONTENT_GUARD_RE）。
+    """
+    q = q or ""
+    if _ENUM_CONTENT_GUARD_RE.search(q):
+        return False
+    return bool(_ENUM_RE.search(q))
+
+
+# 「列舉整份文件的全部子項」只有在問句真的在問文件結構時才合理（測試方法／章節／附錄／
+# 程序／列出全部…）。沒有這類名詞、卻解析到整份文件節點（子項 ≥ _STRUCT_UNNAMED_ITEM_LIMIT），
+# 幾乎都是問句提到了文件名稱而已（「MIL-STD-810H 對 X 有什麼要求」），不該回 Method 清單。
+_STRUCT_NOUN_RE = re.compile(
+    r"(測試方法|方法|method|章節|section|annex|附錄|子項目|子測試|程序|procedure|項目|清單|"
+    r"列出|列舉|全部|所有|哪幾|幾個測試|幾種測試|測試有哪些|包含哪些測試)",
+    re.IGNORECASE,
+)
 
 
 # 混合查詢路由：關係/引用/版本/結構類 → 走 Agent（KG 工具有用、且 Agent 在這類是 RAG 超集）；
@@ -1351,6 +1387,20 @@ _SPEC_ID_RE = re.compile(
 _GENERIC_ENUM_RE = re.compile(r"(幾個|幾種|幾類|多少個?|哪些|哪幾|列出|列舉|清單)")
 
 
+# 「目的／定義」題 + 具名的結構對象（2026-09-07 評測）：
+# 「Annex E 的 Category 24 是什麼？目的為何？」純 RAG 撈到的是 Table 514.8-I 的段落，
+# Agent 走 _structural_evidence（aspect=objective）＋補充檢索才找到 Annex E 的最低完整性測試。
+# 混合模式原本把這類題判給 RAG，拿不到 Agent 的優勢。
+# 條件刻意收窄：問句要同時有「目的／用途／定義」類詞，以及一個具名結構對象
+# （Category N / Annex X / Method N / Task N / Procedure N / Part One…）或 KG 母節點，
+# 避免「鹽溶液濃度是什麼」這種一般內容題被送去較慢的 Agent。
+_ASPECT_Q_RE = re.compile(r"(目的|用途|定義|意義|purpose|definition|objective|defined)", re.IGNORECASE)
+_STRUCT_ID_RE = re.compile(
+    r"\b(category|annex|method|task|procedure|part)\s*(\d{1,3}(?:\.\d)?|[A-Z]\b|[IVX]+\b|one|two|three)\b",
+    re.IGNORECASE,
+)
+
+
 def _kg_parent_in_question(db: Session, q: str) -> Optional[str]:
     """問句是否包含某個「KG 母節點」（有 contains 子節點的實體）名稱，回傳最長命中。
 
@@ -1389,7 +1439,13 @@ def route_mode(question: str, db: Optional[Session] = None) -> str:
     q = question or ""
     if _RELATION_RE.search(q) or _ENUM_STRUCT_RE.search(q):
         return "agent"
-    if db is not None and _GENERIC_ENUM_RE.search(q) and _kg_parent_in_question(db, q):
+    # 目的／定義題（具名結構對象）→ Agent：結構證據撈齊子項內容 + 補充檢索（見 _ASPECT_Q_RE 說明）
+    if _ASPECT_Q_RE.search(q) and (
+            _STRUCT_ID_RE.search(q) or (db is not None and _kg_parent_in_question(db, q))):
+        return "agent"
+    if (db is not None and _GENERIC_ENUM_RE.search(q)
+            and not _ENUM_CONTENT_GUARD_RE.search(q)   # 「幾個 24 小時週期」是數值題，不是列舉
+            and _kg_parent_in_question(db, q)):
         return "agent"
     return "rag"
 
@@ -2170,6 +2226,14 @@ def run_agent(
                 db, "list_subitems", {"name": enumeration_target(db, question) or question})
         except Exception as e:
             logger.warning("enumeration list_subitems failed: %s", e)
+            fb = None
+        # 解析到整份文件（子項數達門檻）但問句沒有任何結構名詞 → 不是在問文件結構，放行給下方路徑
+        # （實測「MIL-STD-810H 對筆電 USB-C 充電功率有什麼要求」被列成 29 個 Method）。
+        if (isinstance(fb, dict) and fb.get("subitems")
+                and len(fb["subitems"]) >= _STRUCT_UNNAMED_ITEM_LIMIT
+                and not _STRUCT_NOUN_RE.search(question or "")):
+            logger.debug("enumeration early-exit 放棄：對象「%s」為整份文件（%d 子項）但問句無結構名詞",
+                         fb.get("matched"), len(fb["subitems"]))
             fb = None
         if isinstance(fb, dict) and fb.get("subitems"):
             yield {"type": "thought", "step": 0,
