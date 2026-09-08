@@ -501,6 +501,38 @@ def resolve_query(question: str,
     return {"query": fallback, "rewritten": fallback != q, "source": "rule"}
 
 
+_METHOD_TAG_RE = re.compile(r"METHOD\s+\d{3}\.\d+", re.I)
+
+
+def _inferred_subject_afterword(question: str, evidence: Optional[List[Dict[str, Any]]]) -> str:
+    """問句沒有可辨識的測試主體、對象是靠檢索推斷出來時，在答案末尾標明推斷結果。
+
+    「先答再說明」而不是反問：使用者一眼就能看出系統猜的是哪一項測試，猜錯了
+    可以立刻糾正 —— 同一個參數在不同 Method 裡的數值都不一樣，默默猜錯最危險。
+    同時引導使用者下次寫出測試名稱或方法編號：實測寫了名稱的題組準確率高
+    5–15 個百分點。問句本身有主體（白名單抓得到）就不加，每題都加會變成嘮叨。
+    """
+    if not _lacks_subject(question):
+        return ""
+    counts: Dict[str, int] = {}
+    for ev in evidence or []:
+        sp = str(ev.get("section_path") or "").split(",")[0]
+        m = _METHOD_TAG_RE.search(sp)
+        if m:
+            key = re.sub(r"\s+", " ", m.group(0).upper())
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ""
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    top = ranked[0][0]
+    others = [k for k, _ in ranked[1:3]]
+    if others:
+        head = f"以上依檢索結果主要引用 {top}（另有 {'、'.join(others)} 的段落）。"
+    else:
+        head = f"以上依檢索結果判斷你問的是 {top} 的內容。"
+    return "\n\n" + head + "如果你要問的是其他測試，請在問題中寫出測試名稱或方法編號，答案會更準確。"
+
+
 def _clarify_scope_text(db: Session, question: str) -> str:
     """問題缺少查詢對象時的反問內容。
 
@@ -1551,7 +1583,8 @@ def run_rag_only_events(db: Session, question: str,
                                                     retry_budget=_new_retry_budget())
     if ans and ans.strip():
         note = _coverage_note(max(0, n_total - n_used), 0)
-        yield ("final", (subject_caution + ans.strip() + (note or ""), sources))
+        # 問句沒有可辨識主體時，標明答案是依哪個 Method 的段落推斷的（見 _inferred_subject_afterword）
+        yield ("final", (subject_caution + ans.strip() + (note or "") + _inferred_subject_afterword(question, seeded), sources))
         return
     closest = [{"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
                for ev in seeded[:3]]
@@ -1891,6 +1924,7 @@ def get_retrieval_scope(db: Session) -> Dict[str, Any]:
 
 
 _RESOLVED_KEY = "resolved_query"
+_AFTERWORD_KEY = "subject_afterword"   # run_agent 探查分支 → _emit_final：推斷主體的末尾說明
 
 
 def remember_resolved(db: Session, resolved: Dict[str, Any]) -> None:
@@ -2093,6 +2127,15 @@ def _emit_final(db: Session, question: str, text: str,
                 "page": ev.get("page"), "snippet": ev.get("snippet"),
                 "score": ev.get("score")} for ev in fallback_evidence[:5]]
 
+    # 主體是靠檢索推斷出來的（run_agent 反問前的探查分支）→ 答案末尾標明推斷結果。
+    # 一次性：取出即清除，反問／查無的文字不加。
+    try:
+        aw = db.info.pop(_AFTERWORD_KEY, "")
+    except Exception:  # noqa: BLE001
+        aw = ""
+    if aw and txt and not _is_no_answer(txt):
+        txt = txt.rstrip() + aw
+
     out = {"type": "final", "text": txt, "sources": src}
     if kg_graph:
         out["kg_graph"] = kg_graph   # 關聯題的引用網/版本鏈，前端畫力導向小圖
@@ -2168,6 +2211,11 @@ def run_agent(
                 _probe, _pconf = [], None
             if _probe and _pconf is not None and _pconf >= _thr:
                 logger.info("問句缺主體但檢索信心 %.3f ≥ %.2f，跳過反問直接作答", _pconf, _thr)
+                # 對象是推斷出來的 → 最終答案末尾標明（由 _emit_final 統一附加）
+                try:
+                    db.info[_AFTERWORD_KEY] = _inferred_subject_afterword(question, _probe)
+                except Exception:  # noqa: BLE001
+                    pass
                 yield {"type": "thought", "step": 0,
                        "text": f"問題未指名測試類型，但檢索到高相關內容（信心 {_pconf:.2f}），直接作答。"}
             else:

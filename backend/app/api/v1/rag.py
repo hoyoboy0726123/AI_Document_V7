@@ -258,6 +258,13 @@ def query_rag(
                 answer, {c["source_num"]: c["text"] for c in contexts})
         except Exception as exc:
             logger.warning("引用校驗失敗，保留原答案: %s", exc)
+    # 問句沒有可辨識的測試主體時，標明答案是依哪個 Method 的段落推斷的，
+    # 並提示寫出測試名稱會更準（見 agent._inferred_subject_afterword）。
+    try:
+        answer = (answer or "").rstrip() + agent._inferred_subject_afterword(
+            question, [{"section_path": getattr(c, "section_path", None)} for c, _ in filtered])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("主體推斷說明附加失敗: %s", exc)
     return schemas.RAGQueryResponse(
         answer=answer,
         sources=sources,
@@ -392,6 +399,17 @@ def query_stream(
                     if stream_chunk.get("type") == "content":
                         answer_parts.append(stream_chunk.get("text") or "")
                     yield f"data: {json.dumps(stream_chunk, ensure_ascii=False)}\n\n"
+                # 問句沒有可辨識主體時，補一段「答案是依哪個 Method 推斷」的說明
+                # （與 /rag/query、/agent/route 一致；見 agent._inferred_subject_afterword）
+                try:
+                    _aw = agent._inferred_subject_afterword(
+                        question, [{"section_path": getattr(c, "section_path", None)} for c, _ in filtered])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("主體推斷說明附加失敗: %s", exc)
+                    _aw = ""
+                if _aw:
+                    answer_parts.append(_aw)
+                    yield f"data: {json.dumps({'type': 'content', 'text': _aw}, ensure_ascii=False)}\n\n"
 
             # 引用事後校驗。sources 已在生成「之前」送出（見上方），這裡只在
             # 真的有修正時補送一個 corrected_answer 事件，前端用它替換畫面上
