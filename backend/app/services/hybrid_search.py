@@ -257,6 +257,18 @@ _EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
 _TRANSLATE_CACHE: Dict[str, str] = {}
 _TRANSLATE_CACHE_MAX = 512
 _TRANSLATE_LOCK = threading.Lock()
+
+
+def cached_translation(query: str) -> str:
+    """這句查詢已經翻譯過的英文檢索詞；只讀快取，絕不觸發 LLM。沒有就回空字串。
+
+    供 rerank 的 cross-encoder 打分用：中文問句對英文段落的 CE 分數在「不寫
+    規範編號的自然問法」下常常趨近 0（實測「摔落測試要摔幾次」對 Table 516.8-IX
+    那一頁 0.007），同一頁對翻譯後的英文檢索詞是 0.856。翻譯只在 BM25 中文
+    零命中時才會發生，這裡只是把已經算過的結果借來用，沒有額外成本。
+    """
+    with _TRANSLATE_LOCK:
+        return _TRANSLATE_CACHE.get((query or "").strip(), "") or ""
 # 共用 executor：逾時後不等待該執行緒收尾（見 keyword_search 內註解）。
 # worker 數刻意小，避免翻譯卡住時無上限累積執行緒。
 _TRANSLATE_POOL = concurrent.futures.ThreadPoolExecutor(

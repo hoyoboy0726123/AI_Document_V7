@@ -1301,7 +1301,10 @@ _ENUM_CONTENT_GUARD_RE = re.compile(
     r"(?:小時|天|週期|週|循環|次|度|秒|分鐘|分|公尺|公分|毫米|公里|公斤|克|%|％|°|℃|℉|"
     r"(?:mm|cm|km|kg|kPa|psi|hz|khz|db|w/m|m/s|ft|lb|"
     r"hours?|days?|weeks?|cycles?|periods?|minutes?|seconds?|times)\b)"
-    r"|有什麼\s*(要求|規定|規範|限制|條件|建議|影響|差異|差別|不同|特性|特點|注意|作用|功能|目的|意義|風險|標準|規格|定義)",
+    r"|有什麼\s*(要求|規定|規範|限制|條件|建議|影響|差異|差別|不同|特性|特點|注意|作用|功能|目的|意義|風險|標準|規格|定義)"
+    # 「哪些＋內容名詞」也是內容題：「要檢查筆電哪些地方」「用哪些菌種」實測都被
+    # list_subitems 早退劫持成章節清單。結構名詞（方法／程序／章節／測試）不在此列。
+    r"|哪些\s*(地方|部位|位置|菌種|菌|材料|參數|條件|問題|現象|影響|數值|規定|要求|限制|情況|因素|環境|零件|部件|東西|狀況|缺陷|損壞|風險)",
     re.IGNORECASE,
 )
 
@@ -2153,10 +2156,25 @@ def run_agent(
             yield {"type": "thought", "step": 0,
                    "text": f"問題未指名對象，沿用上一輪的「{inherited}」繼續查：{question}"}
         else:
-            yield {"type": "thought", "step": 0,
-                   "text": "問題未指名測試類型，先反問以縮小範圍（避免任意挑一項測試作答）。"}
-            yield _emit_final(db, question, _clarify_scope_text(db, question), [])
-            return
+            # 反問之前先查一次：不懂規範編號的使用者本來就不會寫測試名稱
+            # （「筆電要在有燃油蒸氣的環境使用，需要做什麼測試」「拿到沙漠用，
+            # 溫度最高幾度」），白名單抓不到主體不代表語料答不了。檢索的
+            # cross-encoder 信心過門檻就直接作答；真的撈不到相關段落才反問。
+            _thr = getattr(settings, "RAG_LOWCONF_CE_THRESHOLD", 0.15)
+            try:
+                _probe, _pconf = _seed_evidence_via_rag(db, question, top_k=5)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("反問前的試探檢索失敗: %s", exc)
+                _probe, _pconf = [], None
+            if _probe and _pconf is not None and _pconf >= _thr:
+                logger.info("問句缺主體但檢索信心 %.3f ≥ %.2f，跳過反問直接作答", _pconf, _thr)
+                yield {"type": "thought", "step": 0,
+                       "text": f"問題未指名測試類型，但檢索到高相關內容（信心 {_pconf:.2f}），直接作答。"}
+            else:
+                yield {"type": "thought", "step": 0,
+                       "text": "問題未指名測試類型，先反問以縮小範圍（避免任意挑一項測試作答）。"}
+                yield _emit_final(db, question, _clarify_scope_text(db, question), [])
+                return
 
     # 關係題 + 問句點名某規範 → 先給 KG 的權威關係清單，不要讓後面的路徑搶走。
     #
