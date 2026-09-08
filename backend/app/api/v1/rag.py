@@ -261,8 +261,9 @@ def query_rag(
     # 問句沒有可辨識的測試主體時，標明答案是依哪個 Method 的段落推斷的，
     # 並提示寫出測試名稱會更準（見 agent._inferred_subject_afterword）。
     try:
-        answer = (answer or "").rstrip() + agent._inferred_subject_afterword(
-            question, [{"section_path": getattr(c, "section_path", None)} for c, _ in filtered])
+        if not agent._is_no_answer(answer or ""):   # 「查無相關資料」後面不該接「以上依檢索結果判斷…」
+            answer = (answer or "").rstrip() + agent._inferred_subject_afterword(
+                question, [{"section_path": getattr(c, "section_path", None)} for c, _ in filtered])
     except Exception as exc:  # noqa: BLE001
         logger.warning("主體推斷說明附加失敗: %s", exc)
     return schemas.RAGQueryResponse(
@@ -402,7 +403,7 @@ def query_stream(
                 # 問句沒有可辨識主體時，補一段「答案是依哪個 Method 推斷」的說明
                 # （與 /rag/query、/agent/route 一致；見 agent._inferred_subject_afterword）
                 try:
-                    _aw = agent._inferred_subject_afterword(
+                    _aw = "" if agent._is_no_answer("".join(answer_parts)) else agent._inferred_subject_afterword(
                         question, [{"section_path": getattr(c, "section_path", None)} for c, _ in filtered])
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("主體推斷說明附加失敗: %s", exc)

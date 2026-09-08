@@ -1584,7 +1584,8 @@ def run_rag_only_events(db: Session, question: str,
     if ans and ans.strip():
         note = _coverage_note(max(0, n_total - n_used), 0)
         # 問句沒有可辨識主體時，標明答案是依哪個 Method 的段落推斷的（見 _inferred_subject_afterword）
-        yield ("final", (subject_caution + ans.strip() + (note or "") + _inferred_subject_afterword(question, seeded), sources))
+        _aw = "" if _is_no_answer(ans) else _inferred_subject_afterword(question, seeded)
+        yield ("final", (subject_caution + ans.strip() + (note or "") + _aw, sources))
         return
     closest = [{"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
                for ev in seeded[:3]]
