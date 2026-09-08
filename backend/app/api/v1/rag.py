@@ -29,16 +29,24 @@ def _sse_data(payload: dict) -> str:
 
 
 def _hybrid_filtered(db, payload, search_query, embedding, vector_config, top_k,
-                     document_id=None):
+                     document_id=None, document_ids=None):
     """Thin adapter → services.retrieval.hybrid_retrieve（檢索邏輯的唯一實作）。
 
     document_id 若有傳入則覆寫 payload 的值 —— 用於「查詢裡點名了規範編號」時
-    把範圍鎖到該文件（見 retrieval.resolve_spec_scope）。
+    把範圍鎖到該文件（見 retrieval.resolve_spec_filter）。同一份規範拆成多份
+    文件時是 document_ids：使用者自己鎖定的文件若在其中，較窄的那個優先；
+    不在其中就同單一文件的既有行為，由規範編號覆寫。
     """
+    doc_id = document_id or payload.document_id
+    if document_ids and doc_id and doc_id in document_ids:
+        document_ids = None
+    elif document_ids:
+        doc_id = None
     return retrieval.hybrid_retrieve(
         db, search_query, embedding, top_k,
         vector_config=vector_config,
-        document_id=document_id or payload.document_id,
+        document_id=doc_id,
+        document_ids=document_ids,
         classification_id=payload.classification_id,
         project_id=payload.project_id,
         folder_ids=payload.folder_ids,
@@ -148,14 +156,14 @@ def query_rag(
 
     # 規範編號從「嵌入用字串」移到「文件過濾條件」：它在目錄／頁首／參考文獻
     # 出現上千次，留在查詢裡會主導向量、把答案段落擠出候選池。
-    vector_query, spec_doc_id = retrieval.resolve_spec_scope(db, search_query)
+    vector_query, spec_filter = retrieval.resolve_spec_filter(db, search_query)
     embeddings = ai.embed_query(vector_query)
     if not embeddings:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="嵌入計算失敗")
 
     filtered = _hybrid_filtered(
         db, payload, search_query, embeddings[0], vector_config, payload.top_k,
-        document_id=spec_doc_id,
+        **spec_filter,
     )
     filtered = _augment_for_values(
         db, payload, lambda q: (ai.embed_query(q) or [None])[0],
@@ -292,7 +300,7 @@ def query_stream(
     if (has_cn and not has_cn_opt) or (not has_cn and has_cn_opt):
         search_query = question
 
-    vector_query, spec_doc_id = retrieval.resolve_spec_scope(db, search_query)
+    vector_query, spec_filter = retrieval.resolve_spec_filter(db, search_query)
     embeddings = ai.embed_query(vector_query)
     if not embeddings:
         def _embed_error():
@@ -303,7 +311,7 @@ def query_stream(
     top_k = payload.top_k or 5
     filtered = _hybrid_filtered(
         db, payload, search_query, embeddings[0], vector_config, top_k,
-        document_id=spec_doc_id,
+        **spec_filter,
     )
     filtered = _augment_for_values(
         db, payload, lambda q: (ai.embed_query(q) or [None])[0],

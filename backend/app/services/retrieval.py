@@ -261,49 +261,75 @@ def resolve_spec_scope(db: Session, question: str) -> Tuple[str, Optional[str]]:
     單純移除編號會失去「只有編號才指得出文件」的能力（例如「MIL-STD-461G 的
     CE102」），所以把編號改用來鎖定 document_id —— 兩者兼得。
     BM25 那一路仍拿原始字串，編號在關鍵字比對上是有用訊號。
+
+    找不到對應文件就不縮限範圍（可能是語料裡沒有的外部規範），但仍把編號從
+    嵌入字串移除 —— 它對向量檢索只有干擾。規範對應到**多份**文件時回 None
+    （見 resolve_spec_filter）：寧可不鎖，也不能鎖錯一章。
+    """
+    stripped, flt = resolve_spec_filter(db, question)
+    return stripped, flt.get("document_id")
+
+
+def resolve_spec_groups(db: Session, question: str) -> Tuple[str, List[List[str]]]:
+    """問句裡每個規範編號 → 標題含該編號的**全部**文件 id，一個編號一組。
+
+    回傳 (去編號的字串, [[doc_id, ...], ...])，組的順序 = 編號在問句中出現的順序。
+
+    一份規範不一定只是一份文件：整本 MIL-STD-810H 依章節拆成 12 份文件
+    （VLM 逐頁轉錄）後，每份標題都含「MIL-STD-810H」。舊寫法「取第一個命中
+    就 break」會把整份規範鎖到其中一章 —— 實測拆章後「酸性大氣要看哪個
+    Method」被鎖在第 2 章（Method 500–505），而 518.2 在第 9 章，純 RAG／
+    混合／Agent 三種模式全部回「查無資料」；語料是單一文件時毫無症狀。
+    同一編號只會出現一組（「810H 取代了哪版？810H 的發布日期？」不是比較題）。
     """
     ids = _SPEC_ID_IN_QUERY_RE.findall(question or "")
-    if not ids:
-        return question, None
+    groups: List[List[str]] = []
+    if ids:
+        docs = db.query(models.Document.id, models.Document.title).all()
+        seen: set = set()
+        for raw in ids:
+            norm = re.sub(r"\s+", "", raw).upper()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            group = [doc.id for doc in docs
+                     if norm in re.sub(r"\s+", "", (doc.title or "")).upper()]
+            if group:
+                groups.append(group)
+    stripped = re.sub(r"\s+", " ", _SPEC_ID_IN_QUERY_RE.sub(" ", question or "")).strip()
+    return (stripped or question), groups
 
-    doc_id = None
-    for raw in ids:
-        norm = re.sub(r"\s+", "", raw).upper()
-        for doc in db.query(models.Document.id, models.Document.title).all():
-            if norm in re.sub(r"\s+", "", (doc.title or "")).upper():
-                doc_id = doc.id
-                break
-        if doc_id:
-            break
 
-    # 找不到對應文件就不要縮限範圍（可能是語料裡沒有的外部規範），
-    # 但仍把編號從嵌入字串移除 —— 它對向量檢索只有干擾。
-    stripped = _SPEC_ID_IN_QUERY_RE.sub(" ", question or "")
-    stripped = re.sub(r"\s+", " ", stripped).strip()
-    return (stripped or question), doc_id
+def spec_filter_kwargs(group: List[str]) -> Dict[str, Any]:
+    """一組文件 → hybrid_retrieve 的過濾參數：單一文件用 document_id，多份用 document_ids。"""
+    if not group:
+        return {}
+    return {"document_id": group[0]} if len(group) == 1 else {"document_ids": list(group)}
+
+
+def resolve_spec_filter(db: Session, question: str) -> Tuple[str, Dict[str, Any]]:
+    """resolve_spec_scope 的完整版：回傳 (嵌入用字串, hybrid_retrieve 過濾參數)。
+
+    過濾參數是 {}（沒點名或語料裡沒有）、{"document_id": x}（規範就是一份文件）
+    或 {"document_ids": [...]}（同一份規範拆成多份文件）。只看第一個命中的編號，
+    與 resolve_spec_scope 的行為一致；比較題請用 resolve_spec_groups。
+    """
+    stripped, groups = resolve_spec_groups(db, question)
+    return stripped, (spec_filter_kwargs(groups[0]) if groups else {})
 
 
 def resolve_spec_docs(db: Session, question: str) -> Tuple[str, List[str]]:
-    """多規範版的 resolve_spec_scope：回傳 (去編號的字串, 所有命中的 document_id)。
+    """多規範版的 resolve_spec_scope：回傳 (去編號的字串, 每個規範各一個 document_id)。
 
     resolve_spec_scope 只取第一個命中的編號就 break，對「A 與 B 各是多少」
     這種比較題會整個偏向其中一份。實測「MIL-STD-810H 的溫度量測公差與
     MIL-STD-331D 的溫度量測公差各是多少」候選池 10 塊裡 9 塊來自 810H、
     0 塊來自 331D —— 系統回「查無相關資料」，因為它其實只查了一份。
+
+    相容用途：每組只回第一份文件。規範拆成多份文件時請改用 resolve_spec_groups。
     """
-    ids = _SPEC_ID_IN_QUERY_RE.findall(question or "")
-    doc_ids: List[str] = []
-    if ids:
-        docs = db.query(models.Document.id, models.Document.title).all()
-        for raw in ids:
-            norm = re.sub(r"\s+", "", raw).upper()
-            for doc in docs:
-                if norm in re.sub(r"\s+", "", (doc.title or "")).upper():
-                    if doc.id not in doc_ids:
-                        doc_ids.append(doc.id)
-                    break
-    stripped = re.sub(r"\s+", " ", _SPEC_ID_IN_QUERY_RE.sub(" ", question or "")).strip()
-    return (stripped or question), doc_ids
+    stripped, groups = resolve_spec_groups(db, question)
+    return stripped, [g[0] for g in groups]
 
 
 # 程序覆蓋補撈的觸發條件：問的是「怎麼做／流程／程序」且點名了方法號。
@@ -368,6 +394,7 @@ def hybrid_retrieve(
     *,
     vector_config: Optional[Dict[str, Any]] = None,
     document_id: Optional[str] = None,
+    document_ids: Optional[List[str]] = None,
     classification_id: Optional[str] = None,
     project_id: Optional[str] = None,
     folder_ids: Optional[List[str]] = None,
@@ -376,6 +403,8 @@ def hybrid_retrieve(
 
     回傳 [(chunk, score)]。keyword-only 命中（向量低分但關鍵字命中）不被向量門檻砍掉。
     過濾參數（document/classification/project/folder）全 None 時為全域檢索（agent 用）。
+    document_ids 是「同一份規範拆成多份文件」的鎖定（見 resolve_spec_filter）；
+    與 document_id 同時給時兩者皆須滿足。
     """
     cfg = _get_vector_config(db, vector_config)
     candidate_k = top_k * cfg["search_multiplier"]
@@ -406,6 +435,8 @@ def hybrid_retrieve(
             continue
         doc = chunk.document
         if document_id and doc.id != document_id:
+            continue
+        if document_ids and doc.id not in document_ids:
             continue
         if classification_id and doc.classification_id != classification_id:
             continue
@@ -452,6 +483,8 @@ def hybrid_retrieve(
                 continue
             doc = ch.document
             if document_id and doc.id != document_id:
+                continue
+            if document_ids and doc.id not in document_ids:
                 continue
             if classification_id and doc.classification_id != classification_id:
                 continue

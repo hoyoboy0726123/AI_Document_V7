@@ -1929,32 +1929,36 @@ def _seed_evidence_via_rag(db: Session, question: str, top_k: int = 5) -> tuple:
     # 10 塊裡 9 塊來自 810H、0 塊來自 331D，於是系統回「查無相關資料」——
     # 它其實只查了一份，另一份根本沒進候選池，rerank 再強也救不回來。
     scope = get_retrieval_scope(db)
-    stripped_q, spec_docs = retrieval.resolve_spec_docs(db, question)
+    # 一個規範編號一組文件：整本規範拆成多章（多份文件）時整組一起鎖，
+    # 不能只鎖第一份（見 retrieval.resolve_spec_groups）。
+    stripped_q, spec_groups = retrieval.resolve_spec_groups(db, question)
+    spec_docs = [g[0] for g in spec_groups]
     # 使用者已經明確鎖定文件時，不再做「比較題分頭檢索」——那會跨出鎖定範圍，
     # 正是使用者要避免的事。鎖定優先於問句裡提到的規範編號。
-    if len(spec_docs) >= 2 and not scope.get("document_id"):
-        per_doc = max(2, top_k // len(spec_docs))
+    if len(spec_groups) >= 2 and not scope.get("document_id"):
+        per_doc = max(2, top_k // len(spec_groups))
         emb2 = ai.embed_query(stripped_q) or embeddings
         filtered = []
-        for did in spec_docs:
+        for group in spec_groups:
             try:
                 filtered.extend(retrieval.hybrid_retrieve(
                     db, stripped_q, emb2[0], per_doc,
-                    **{**scope, "document_id": did}))
+                    **{**scope, **retrieval.spec_filter_kwargs(group)}))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("比較題分頭檢索失敗 doc=%s: %s", did[:8], exc)
+                logger.warning("比較題分頭檢索失敗 doc=%s: %s", group[0][:8], exc)
         logger.info("比較題分頭檢索：%d 份規範，各取 %d 塊，共 %d 塊",
-                    len(spec_docs), per_doc, len(filtered))
+                    len(spec_groups), per_doc, len(filtered))
     else:
         # 問句點名「恰好一份」規範 → 鎖定該文件檢索。/rag/query 端點一直有這個
         # 行為（resolve_spec_scope），混合路由的 RAG 分支漏了 —— 實測 p04
         # 「MIL-STD-810H 的適用範圍」第 1 名來源是 MIL-HDBK-310，答案把 310 的
         # 限制事項安到 810H 頭上。關係題不鎖：「A 被哪些 810H 方法引用」的
         # 「810H」常解析不出來（縮寫），鎖到 A 會把另一邊的證據全擋掉。
-        if (len(spec_docs) == 1 and not scope.get("document_id")
+        if (len(spec_groups) == 1 and not scope.get("document_id")
                 and not _RELATION_RE.search(question)):
-            scope = {**scope, "document_id": spec_docs[0]}
-            logger.info("問句點名單一規範，檢索鎖定該文件：%s", spec_docs[0][:8])
+            scope = {**scope, **retrieval.spec_filter_kwargs(spec_groups[0])}
+            logger.info("問句點名單一規範，檢索鎖定該規範的 %d 份文件：%s",
+                        len(spec_groups[0]), spec_docs[0][:8])
         filtered = retrieval.hybrid_retrieve(db, question, embeddings[0], top_k, **scope)
     if not filtered:
         return [], None
