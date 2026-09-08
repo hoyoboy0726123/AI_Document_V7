@@ -282,6 +282,22 @@ _TRANSLATE_PROMPT = (
 )
 
 
+def _translate_options(dedicated_model: Optional[str]) -> Dict[str, object]:
+    """翻譯呼叫的 Ollama options。
+
+    關鍵是 num_ctx：Ollama 把「同一個模型、不同 num_ctx」當成不同的 runner，
+    翻譯用 2048、回答用 OLLAMA_NUM_CTX（24576）就會讓主模型每一題卸載再載入
+    兩次 —— 實測 gemma4:12b 每次 load 6.5 秒，翻譯一句 7 秒、接著回答又等
+    6.5 秒；num_ctx 對齊後同一句翻譯 0.3 秒。所以用主模型翻譯時不覆寫 num_ctx
+    （沿用 _default_options 的 OLLAMA_NUM_CTX），只有 RAG_TRANSLATE_MODEL 指定的
+    專用小模型才用小 context 省 VRAM。
+    """
+    opts: Dict[str, object] = {"temperature": 0.0}
+    if dedicated_model:
+        opts["num_ctx"] = 2048
+    return opts
+
+
 def _translate_for_keyword(query: str) -> str:
     """把中文查詢轉成英文檢索詞（含快取）。任何失敗都回空字串，由呼叫端當作沒發生。"""
     key = query.strip()
@@ -303,13 +319,13 @@ def _translate_for_keyword(query: str) -> str:
         from .ollama_client import get_client
         raw = get_client().chat(
             [{"role": "user", "content": _TRANSLATE_PROMPT.format(q=key)}],
-            model=_model, options={"temperature": 0.0, "num_ctx": 2048},
+            model=_model, options=_translate_options(_model),
         )
     else:
         raw = provider.chat(
             [{"role": "user", "content": _TRANSLATE_PROMPT.format(q=key)}],
             model=_model,
-            options={"temperature": 0.0, "num_ctx": 2048},
+            options=_translate_options(_model),
         )
     terms = " ".join(_EN_WORD_RE.findall(raw or ""))[:120]
 
