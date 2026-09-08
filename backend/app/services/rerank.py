@@ -284,6 +284,13 @@ def top_relevance(query: str, chunks: List[object]) -> Optional[float]:
 
     供低信心 fallback 判斷用：實測相關題 top ≥0.4、離題 ≈0.00。
     cross-encoder 不可用時回 None（呼叫端應略過 gate，不要因此退化）。
+
+    閘門刻意「只看原問句分數」、不用 _predict_max 的英文較高分（2026-09-08 回歸）：
+    英文檢索詞會抹掉主體不符的懲罰 ——「量子電腦的低溫維持條件」翻成英文後對
+    810H 低溫段落打 0.39、「潛水艇耐壓艙壁厚度」打 0.55，語料外題全過 0.15 閘門，
+    數值評測幻覺率 0.0 → 0.2。實測門檻無法分離（合法自然問法英文分數 0.39 起跳，
+    與語料外題重疊）。代價：不寫測試名稱的自然問法會走反問／查無，防幻覺優先。
+    排序（_score_cross_encoder）仍用雙語較高分 —— 那裡只影響順序，沒有編造風險。
     """
     if not chunks:
         return None
@@ -292,7 +299,7 @@ def top_relevance(query: str, chunks: List[object]) -> Optional[float]:
         return None
     try:
         texts = [(getattr(c, "text", "") or "")[:_SNIPPET_CHARS] for c in chunks]
-        scores = _predict_max(model, query, texts)
+        scores = [float(s) for s in model.predict([(query, t) for t in texts])]
         return float(max(scores)) if scores else None
     except Exception as e:
         logger.warning("top_relevance scoring failed: %s", e)
