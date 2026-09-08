@@ -501,6 +501,38 @@ def resolve_query(question: str,
     return {"query": fallback, "rewritten": fallback != q, "source": "rule"}
 
 
+_METHOD_TAG_RE = re.compile(r"METHOD\s+\d{3}\.\d+", re.I)
+
+
+def _inferred_subject_afterword(question: str, evidence: Optional[List[Dict[str, Any]]]) -> str:
+    """問句沒有可辨識的測試主體、對象是靠檢索推斷出來時，在答案末尾標明推斷結果。
+
+    「先答再說明」而不是反問：使用者一眼就能看出系統猜的是哪一項測試，猜錯了
+    可以立刻糾正 —— 同一個參數在不同 Method 裡的數值都不一樣，默默猜錯最危險。
+    同時引導使用者下次寫出測試名稱或方法編號：實測寫了名稱的題組準確率高
+    5–15 個百分點。問句本身有主體（白名單抓得到）就不加，每題都加會變成嘮叨。
+    """
+    if not _lacks_subject(question):
+        return ""
+    counts: Dict[str, int] = {}
+    for ev in evidence or []:
+        sp = str(ev.get("section_path") or "").split(",")[0]
+        m = _METHOD_TAG_RE.search(sp)
+        if m:
+            key = re.sub(r"\s+", " ", m.group(0).upper())
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ""
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    top = ranked[0][0]
+    others = [k for k, _ in ranked[1:3]]
+    if others:
+        head = f"以上依檢索結果主要引用 {top}（另有 {'、'.join(others)} 的段落）。"
+    else:
+        head = f"以上依檢索結果判斷你問的是 {top} 的內容。"
+    return "\n\n" + head + "如果你要問的是其他測試，請在問題中寫出測試名稱或方法編號，答案會更準確。"
+
+
 def _clarify_scope_text(db: Session, question: str) -> str:
     """問題缺少查詢對象時的反問內容。
 
@@ -1287,9 +1319,48 @@ _ENUM_RE = re.compile(
 )
 
 
+# 列舉詞的「內容題」否決（2026-09-07 評測回歸）：
+#   1. 計數詞後面接的是「量」而不是「項目」：「最少要幾個 24 小時週期」「幾度」「多少 kPa」——
+#      這是在問數值，不是在問清單。實測鹽霧週期題（Q03）被 list_subitems 攔截，
+#      回了 METHOD 509.7 的五個章節標題，持續時間完全沒答。
+#   2. 「有什麼」後面接的是內容名詞（要求/規定/限制/條件/影響…）：「對 USB-C 充電功率
+#      有什麼要求」是在問規範內容，不是在問子項目。實測語料外題（Q30）被同一路徑劫持，
+#      回了 29 個 Method 的清單，正確答案應是「查無」。
+_ENUM_CONTENT_GUARD_RE = re.compile(
+    # 注意：不能在中文單位後面放 \b —— 「小時週期」裡「時」「週」都是 \w，中間沒有字邊界，
+    # 加了 \b 整條就不會命中；\b 只套在英文單位上。
+    r"(幾個|幾種|幾類|多少個?)\s*[\d.,]*\s*"
+    r"(?:小時|天|週期|週|循環|次|度|秒|分鐘|分|公尺|公分|毫米|公里|公斤|克|%|％|°|℃|℉|"
+    r"(?:mm|cm|km|kg|kPa|psi|hz|khz|db|w/m|m/s|ft|lb|"
+    r"hours?|days?|weeks?|cycles?|periods?|minutes?|seconds?|times)\b)"
+    r"|有什麼\s*(要求|規定|規範|限制|條件|建議|影響|差異|差別|不同|特性|特點|注意|作用|功能|目的|意義|風險|標準|規格|定義)"
+    # 「哪些＋內容名詞」也是內容題：「要檢查筆電哪些地方」「用哪些菌種」實測都被
+    # list_subitems 早退劫持成章節清單。結構名詞（方法／程序／章節／測試）不在此列。
+    r"|哪些\s*(地方|部位|位置|菌種|菌|材料|參數|條件|問題|現象|影響|數值|規定|要求|限制|情況|因素|環境|零件|部件|東西|狀況|缺陷|損壞|風險)",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_enumeration(q: str) -> bool:
-    """判斷是否為列舉題（有哪些/列出/子項目…），用於確定性 KG 列舉 fallback。"""
-    return bool(_ENUM_RE.search(q or ""))
+    """判斷是否為列舉題（有哪些/列出/子項目…），用於確定性 KG 列舉 fallback。
+
+    計數詞接單位（「幾個 24 小時週期」）或「有什麼＋內容名詞」（「有什麼要求」）
+    是內容題，不算列舉（見 _ENUM_CONTENT_GUARD_RE）。
+    """
+    q = q or ""
+    if _ENUM_CONTENT_GUARD_RE.search(q):
+        return False
+    return bool(_ENUM_RE.search(q))
+
+
+# 「列舉整份文件的全部子項」只有在問句真的在問文件結構時才合理（測試方法／章節／附錄／
+# 程序／列出全部…）。沒有這類名詞、卻解析到整份文件節點（子項 ≥ _STRUCT_UNNAMED_ITEM_LIMIT），
+# 幾乎都是問句提到了文件名稱而已（「MIL-STD-810H 對 X 有什麼要求」），不該回 Method 清單。
+_STRUCT_NOUN_RE = re.compile(
+    r"(測試方法|方法|method|章節|section|annex|附錄|子項目|子測試|程序|procedure|項目|清單|"
+    r"列出|列舉|全部|所有|哪幾|幾個測試|幾種測試|測試有哪些|包含哪些測試)",
+    re.IGNORECASE,
+)
 
 
 # 混合查詢路由：關係/引用/版本/結構類 → 走 Agent（KG 工具有用、且 Agent 在這類是 RAG 超集）；
@@ -1351,6 +1422,20 @@ _SPEC_ID_RE = re.compile(
 _GENERIC_ENUM_RE = re.compile(r"(幾個|幾種|幾類|多少個?|哪些|哪幾|列出|列舉|清單)")
 
 
+# 「目的／定義」題 + 具名的結構對象（2026-09-07 評測）：
+# 「Annex E 的 Category 24 是什麼？目的為何？」純 RAG 撈到的是 Table 514.8-I 的段落，
+# Agent 走 _structural_evidence（aspect=objective）＋補充檢索才找到 Annex E 的最低完整性測試。
+# 混合模式原本把這類題判給 RAG，拿不到 Agent 的優勢。
+# 條件刻意收窄：問句要同時有「目的／用途／定義」類詞，以及一個具名結構對象
+# （Category N / Annex X / Method N / Task N / Procedure N / Part One…）或 KG 母節點，
+# 避免「鹽溶液濃度是什麼」這種一般內容題被送去較慢的 Agent。
+_ASPECT_Q_RE = re.compile(r"(目的|用途|定義|意義|purpose|definition|objective|defined)", re.IGNORECASE)
+_STRUCT_ID_RE = re.compile(
+    r"\b(category|annex|method|task|procedure|part)\s*(\d{1,3}(?:\.\d)?|[A-Z]\b|[IVX]+\b|one|two|three)\b",
+    re.IGNORECASE,
+)
+
+
 def _kg_parent_in_question(db: Session, q: str) -> Optional[str]:
     """問句是否包含某個「KG 母節點」（有 contains 子節點的實體）名稱，回傳最長命中。
 
@@ -1389,7 +1474,13 @@ def route_mode(question: str, db: Optional[Session] = None) -> str:
     q = question or ""
     if _RELATION_RE.search(q) or _ENUM_STRUCT_RE.search(q):
         return "agent"
-    if db is not None and _GENERIC_ENUM_RE.search(q) and _kg_parent_in_question(db, q):
+    # 目的／定義題（具名結構對象）→ Agent：結構證據撈齊子項內容 + 補充檢索（見 _ASPECT_Q_RE 說明）
+    if _ASPECT_Q_RE.search(q) and (
+            _STRUCT_ID_RE.search(q) or (db is not None and _kg_parent_in_question(db, q))):
+        return "agent"
+    if (db is not None and _GENERIC_ENUM_RE.search(q)
+            and not _ENUM_CONTENT_GUARD_RE.search(q)   # 「幾個 24 小時週期」是數值題，不是列舉
+            and _kg_parent_in_question(db, q)):
         return "agent"
     return "rag"
 
@@ -1492,7 +1583,8 @@ def run_rag_only_events(db: Session, question: str,
                                                     retry_budget=_new_retry_budget())
     if ans and ans.strip():
         note = _coverage_note(max(0, n_total - n_used), 0)
-        yield ("final", (subject_caution + ans.strip() + (note or ""), sources))
+        # 問句沒有可辨識主體時，標明答案是依哪個 Method 的段落推斷的（見 _inferred_subject_afterword）
+        yield ("final", (subject_caution + ans.strip() + (note or "") + _inferred_subject_afterword(question, seeded), sources))
         return
     closest = [{"title": ev.get("title"), "page": ev.get("page"), "text": ev.get("snippet")}
                for ev in seeded[:3]]
@@ -1832,6 +1924,7 @@ def get_retrieval_scope(db: Session) -> Dict[str, Any]:
 
 
 _RESOLVED_KEY = "resolved_query"
+_AFTERWORD_KEY = "subject_afterword"   # run_agent 探查分支 → _emit_final：推斷主體的末尾說明
 
 
 def remember_resolved(db: Session, resolved: Dict[str, Any]) -> None:
@@ -1873,32 +1966,36 @@ def _seed_evidence_via_rag(db: Session, question: str, top_k: int = 5) -> tuple:
     # 10 塊裡 9 塊來自 810H、0 塊來自 331D，於是系統回「查無相關資料」——
     # 它其實只查了一份，另一份根本沒進候選池，rerank 再強也救不回來。
     scope = get_retrieval_scope(db)
-    stripped_q, spec_docs = retrieval.resolve_spec_docs(db, question)
+    # 一個規範編號一組文件：整本規範拆成多章（多份文件）時整組一起鎖，
+    # 不能只鎖第一份（見 retrieval.resolve_spec_groups）。
+    stripped_q, spec_groups = retrieval.resolve_spec_groups(db, question)
+    spec_docs = [g[0] for g in spec_groups]
     # 使用者已經明確鎖定文件時，不再做「比較題分頭檢索」——那會跨出鎖定範圍，
     # 正是使用者要避免的事。鎖定優先於問句裡提到的規範編號。
-    if len(spec_docs) >= 2 and not scope.get("document_id"):
-        per_doc = max(2, top_k // len(spec_docs))
+    if len(spec_groups) >= 2 and not scope.get("document_id"):
+        per_doc = max(2, top_k // len(spec_groups))
         emb2 = ai.embed_query(stripped_q) or embeddings
         filtered = []
-        for did in spec_docs:
+        for group in spec_groups:
             try:
                 filtered.extend(retrieval.hybrid_retrieve(
                     db, stripped_q, emb2[0], per_doc,
-                    **{**scope, "document_id": did}))
+                    **{**scope, **retrieval.spec_filter_kwargs(group)}))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("比較題分頭檢索失敗 doc=%s: %s", did[:8], exc)
+                logger.warning("比較題分頭檢索失敗 doc=%s: %s", group[0][:8], exc)
         logger.info("比較題分頭檢索：%d 份規範，各取 %d 塊，共 %d 塊",
-                    len(spec_docs), per_doc, len(filtered))
+                    len(spec_groups), per_doc, len(filtered))
     else:
         # 問句點名「恰好一份」規範 → 鎖定該文件檢索。/rag/query 端點一直有這個
         # 行為（resolve_spec_scope），混合路由的 RAG 分支漏了 —— 實測 p04
         # 「MIL-STD-810H 的適用範圍」第 1 名來源是 MIL-HDBK-310，答案把 310 的
         # 限制事項安到 810H 頭上。關係題不鎖：「A 被哪些 810H 方法引用」的
         # 「810H」常解析不出來（縮寫），鎖到 A 會把另一邊的證據全擋掉。
-        if (len(spec_docs) == 1 and not scope.get("document_id")
+        if (len(spec_groups) == 1 and not scope.get("document_id")
                 and not _RELATION_RE.search(question)):
-            scope = {**scope, "document_id": spec_docs[0]}
-            logger.info("問句點名單一規範，檢索鎖定該文件：%s", spec_docs[0][:8])
+            scope = {**scope, **retrieval.spec_filter_kwargs(spec_groups[0])}
+            logger.info("問句點名單一規範，檢索鎖定該規範的 %d 份文件：%s",
+                        len(spec_groups[0]), spec_docs[0][:8])
         filtered = retrieval.hybrid_retrieve(db, question, embeddings[0], top_k, **scope)
     if not filtered:
         return [], None
@@ -2030,6 +2127,15 @@ def _emit_final(db: Session, question: str, text: str,
                 "page": ev.get("page"), "snippet": ev.get("snippet"),
                 "score": ev.get("score")} for ev in fallback_evidence[:5]]
 
+    # 主體是靠檢索推斷出來的（run_agent 反問前的探查分支）→ 答案末尾標明推斷結果。
+    # 一次性：取出即清除，反問／查無的文字不加。
+    try:
+        aw = db.info.pop(_AFTERWORD_KEY, "")
+    except Exception:  # noqa: BLE001
+        aw = ""
+    if aw and txt and not _is_no_answer(txt):
+        txt = txt.rstrip() + aw
+
     out = {"type": "final", "text": txt, "sources": src}
     if kg_graph:
         out["kg_graph"] = kg_graph   # 關聯題的引用網/版本鏈，前端畫力導向小圖
@@ -2093,10 +2199,30 @@ def run_agent(
             yield {"type": "thought", "step": 0,
                    "text": f"問題未指名對象，沿用上一輪的「{inherited}」繼續查：{question}"}
         else:
-            yield {"type": "thought", "step": 0,
-                   "text": "問題未指名測試類型，先反問以縮小範圍（避免任意挑一項測試作答）。"}
-            yield _emit_final(db, question, _clarify_scope_text(db, question), [])
-            return
+            # 反問之前先查一次：不懂規範編號的使用者本來就不會寫測試名稱
+            # （「筆電要在有燃油蒸氣的環境使用，需要做什麼測試」「拿到沙漠用，
+            # 溫度最高幾度」），白名單抓不到主體不代表語料答不了。檢索的
+            # cross-encoder 信心過門檻就直接作答；真的撈不到相關段落才反問。
+            _thr = getattr(settings, "RAG_LOWCONF_CE_THRESHOLD", 0.15)
+            try:
+                _probe, _pconf = _seed_evidence_via_rag(db, question, top_k=5)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("反問前的試探檢索失敗: %s", exc)
+                _probe, _pconf = [], None
+            if _probe and _pconf is not None and _pconf >= _thr:
+                logger.info("問句缺主體但檢索信心 %.3f ≥ %.2f，跳過反問直接作答", _pconf, _thr)
+                # 對象是推斷出來的 → 最終答案末尾標明（由 _emit_final 統一附加）
+                try:
+                    db.info[_AFTERWORD_KEY] = _inferred_subject_afterword(question, _probe)
+                except Exception:  # noqa: BLE001
+                    pass
+                yield {"type": "thought", "step": 0,
+                       "text": f"問題未指名測試類型，但檢索到高相關內容（信心 {_pconf:.2f}），直接作答。"}
+            else:
+                yield {"type": "thought", "step": 0,
+                       "text": "問題未指名測試類型，先反問以縮小範圍（避免任意挑一項測試作答）。"}
+                yield _emit_final(db, question, _clarify_scope_text(db, question), [])
+                return
 
     # 關係題 + 問句點名某規範 → 先給 KG 的權威關係清單，不要讓後面的路徑搶走。
     #
@@ -2170,6 +2296,14 @@ def run_agent(
                 db, "list_subitems", {"name": enumeration_target(db, question) or question})
         except Exception as e:
             logger.warning("enumeration list_subitems failed: %s", e)
+            fb = None
+        # 解析到整份文件（子項數達門檻）但問句沒有任何結構名詞 → 不是在問文件結構，放行給下方路徑
+        # （實測「MIL-STD-810H 對筆電 USB-C 充電功率有什麼要求」被列成 29 個 Method）。
+        if (isinstance(fb, dict) and fb.get("subitems")
+                and len(fb["subitems"]) >= _STRUCT_UNNAMED_ITEM_LIMIT
+                and not _STRUCT_NOUN_RE.search(question or "")):
+            logger.debug("enumeration early-exit 放棄：對象「%s」為整份文件（%d 子項）但問句無結構名詞",
+                         fb.get("matched"), len(fb["subitems"]))
             fb = None
         if isinstance(fb, dict) and fb.get("subitems"):
             yield {"type": "thought", "step": 0,

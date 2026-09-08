@@ -257,6 +257,18 @@ _EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
 _TRANSLATE_CACHE: Dict[str, str] = {}
 _TRANSLATE_CACHE_MAX = 512
 _TRANSLATE_LOCK = threading.Lock()
+
+
+def cached_translation(query: str) -> str:
+    """這句查詢已經翻譯過的英文檢索詞；只讀快取，絕不觸發 LLM。沒有就回空字串。
+
+    供 rerank 的 cross-encoder 打分用：中文問句對英文段落的 CE 分數在「不寫
+    規範編號的自然問法」下常常趨近 0（實測「摔落測試要摔幾次」對 Table 516.8-IX
+    那一頁 0.007），同一頁對翻譯後的英文檢索詞是 0.856。翻譯只在 BM25 中文
+    零命中時才會發生，這裡只是把已經算過的結果借來用，沒有額外成本。
+    """
+    with _TRANSLATE_LOCK:
+        return _TRANSLATE_CACHE.get((query or "").strip(), "") or ""
 # 共用 executor：逾時後不等待該執行緒收尾（見 keyword_search 內註解）。
 # worker 數刻意小，避免翻譯卡住時無上限累積執行緒。
 _TRANSLATE_POOL = concurrent.futures.ThreadPoolExecutor(
@@ -268,6 +280,22 @@ _TRANSLATE_PROMPT = (
     "只輸出關鍵詞，用空白分隔，不要解釋、不要標點、不要編號。\n\n"
     "問題：{q}\n英文關鍵詞："
 )
+
+
+def _translate_options(dedicated_model: Optional[str]) -> Dict[str, object]:
+    """翻譯呼叫的 Ollama options。
+
+    關鍵是 num_ctx：Ollama 把「同一個模型、不同 num_ctx」當成不同的 runner，
+    翻譯用 2048、回答用 OLLAMA_NUM_CTX（24576）就會讓主模型每一題卸載再載入
+    兩次 —— 實測 gemma4:12b 每次 load 6.5 秒，翻譯一句 7 秒、接著回答又等
+    6.5 秒；num_ctx 對齊後同一句翻譯 0.3 秒。所以用主模型翻譯時不覆寫 num_ctx
+    （沿用 _default_options 的 OLLAMA_NUM_CTX），只有 RAG_TRANSLATE_MODEL 指定的
+    專用小模型才用小 context 省 VRAM。
+    """
+    opts: Dict[str, object] = {"temperature": 0.0}
+    if dedicated_model:
+        opts["num_ctx"] = 2048
+    return opts
 
 
 def _translate_for_keyword(query: str) -> str:
@@ -291,13 +319,13 @@ def _translate_for_keyword(query: str) -> str:
         from .ollama_client import get_client
         raw = get_client().chat(
             [{"role": "user", "content": _TRANSLATE_PROMPT.format(q=key)}],
-            model=_model, options={"temperature": 0.0, "num_ctx": 2048},
+            model=_model, options=_translate_options(_model),
         )
     else:
         raw = provider.chat(
             [{"role": "user", "content": _TRANSLATE_PROMPT.format(q=key)}],
             model=_model,
-            options={"temperature": 0.0, "num_ctx": 2048},
+            options=_translate_options(_model),
         )
     terms = " ".join(_EN_WORD_RE.findall(raw or ""))[:120]
 

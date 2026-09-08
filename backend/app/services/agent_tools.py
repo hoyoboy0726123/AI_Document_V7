@@ -191,6 +191,22 @@ def _natural_key(number):
         return [0]
 
 
+def _sibling_documents(db: Session, ent, query: str) -> List[Any]:
+    """同一份規範的其他 document 節點（名稱含同一個規範編號），不含 ent 本身。
+
+    規範編號先從查詢字串取，取不到再從命中節點的名稱取；兩邊都沒有編號
+    （例如自訂文件標題）就回空清單，維持單一文件的既有行為。
+    """
+    ids = (retrieval._SPEC_ID_IN_QUERY_RE.findall(query or "")
+           or retrieval._SPEC_ID_IN_QUERY_RE.findall(ent.name or ""))
+    if not ids:
+        return []
+    norm = re.sub(r"\s+", "", ids[0]).upper()
+    docs = db.query(models.KGEntity).filter(models.KGEntity.type == "document").all()
+    return [e for e in docs
+            if e.id != ent.id and norm in re.sub(r"\s+", "", (e.name or "")).upper()]
+
+
 def _tool_list_subitems(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
     """列出某文件/測試/章節的子項目（KG 結構：contains / part_of）。列舉題用這個，不要用 rag_search。"""
     name = str(params.get("name") or params.get("query") or "").strip()
@@ -236,12 +252,19 @@ def _tool_list_subitems(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
 
     ent = sorted(rows, key=_score, reverse=True)[0]
 
+    # 同一份規範拆成多份文件時（整本 MIL-STD-810H 依章節拆成 12 份 VLM 轉錄文件，
+    # 每份都是一個 document 節點），文件層級的列舉要合併所有章節文件的子項目。
+    # 只取分數最高的那一份，「810H 有哪些 Method」就只會列出第一章的 6 個。
+    parents = [ent] + (_sibling_documents(db, ent, name) if ent.type == "document" else [])
+
     # 子項目 = 出向 contains（文件→章節）+ 入向 part_of（子→母）
-    child_ids: List[str] = [
-        r.dst_id for r in db.query(models.KGRelation).filter_by(src_id=ent.id, rel_type="contains").all()
-    ] + [
-        r.src_id for r in db.query(models.KGRelation).filter_by(dst_id=ent.id, rel_type="part_of").all()
-    ]
+    child_ids: List[str] = []
+    for p in parents:
+        child_ids += [
+            r.dst_id for r in db.query(models.KGRelation).filter_by(src_id=p.id, rel_type="contains").all()
+        ] + [
+            r.src_id for r in db.query(models.KGRelation).filter_by(dst_id=p.id, rel_type="part_of").all()
+        ]
     subitems: List[Dict[str, Any]] = []
     if child_ids:
         emap = {e.id: e for e in db.query(models.KGEntity).filter(models.KGEntity.id.in_(child_ids)).all()}
@@ -278,12 +301,18 @@ def _tool_list_subitems(db: Session, params: Dict[str, Any]) -> Dict[str, Any]:
         if t:
             refs.append(t.canonical_id)
 
+    matched = ent.name
+    if len(parents) > 1:
+        # 讓早退答案標明這是跨章節文件的合併結果，而不是單一文件的清單
+        spec = retrieval._SPEC_ID_IN_QUERY_RE.findall(name) or retrieval._SPEC_ID_IN_QUERY_RE.findall(ent.name or "")
+        matched = f"{(spec[0].upper() if spec else ent.name)}（{len(parents)} 份文件合併）"
     return {
-        "matched": ent.name,
+        "matched": matched,
         "kind": (ent.meta or {}).get("kind") or ent.type,
         "subitems": subitems[:60],
         "subitem_count": len(subitems),
         "references": refs,
+        "document_count": len(parents),
     }
 
 

@@ -98,17 +98,40 @@ def _get_cross_encoder():
             return None
 
 
+def _alt_query(query: str) -> str:
+    """同一句查詢的英文檢索詞（hybrid_search 翻譯快取；沒有就空字串）。
+
+    bge-reranker-base 對「中文問句 × 英文段落」的分數，在不寫規範編號的自然
+    問法下會趨近 0：實測「筆電摔落測試要摔幾次？從多高摔？」對含 Table 516.8-IX
+    （122 cm、26 drops）的那一頁只有 0.007，低信心閘門（0.15）直接擋掉；同一頁
+    對翻譯後的「laptop drop test height frequency」是 0.856。四題被閘門擋掉的
+    自然問法（摔落／車內曝曬／浸水／測試順序）英文分數都在 0.39–0.86。
+    因此 CE 分數取「中文問句、英文檢索詞」兩者較高者；沒有翻譯快取時行為不變。
+    """
+    try:
+        from . import hybrid_search  # 延遲載入避免循環匯入
+        return hybrid_search.cached_translation(query)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _predict_max(model, query: str, texts: List[str]) -> List[float]:
+    """每段文字對 query 的 CE 分數；有英文檢索詞時取兩種查詢的較高分。"""
+    scores = [float(s) for s in model.predict([(query, t) for t in texts])]
+    alt = _alt_query(query)
+    if alt and alt.strip().lower() != (query or "").strip().lower():
+        alt_scores = [float(s) for s in model.predict([(alt, t) for t in texts])]
+        scores = [max(a, b) for a, b in zip(scores, alt_scores)]
+    return scores
+
+
 def _score_cross_encoder(query: str, candidates) -> Optional[List[float]]:
     model = _get_cross_encoder()
     if model is None:
         return None
     try:
-        pairs = [
-            (query, (getattr(c, "text", "") or "")[:_SNIPPET_CHARS])
-            for c, _ in candidates
-        ]
-        scores = model.predict(pairs)
-        return [float(s) for s in scores]
+        texts = [(getattr(c, "text", "") or "")[:_SNIPPET_CHARS] for c, _ in candidates]
+        return _predict_max(model, query, texts)
     except Exception as e:
         logger.warning("rerank: cross-encoder predict failed: %s", e)
         return None
@@ -268,9 +291,9 @@ def top_relevance(query: str, chunks: List[object]) -> Optional[float]:
     if model is None:
         return None
     try:
-        pairs = [(query, (getattr(c, "text", "") or "")[:_SNIPPET_CHARS]) for c in chunks]
-        scores = model.predict(pairs)
-        return float(max(scores)) if len(scores) else None
+        texts = [(getattr(c, "text", "") or "")[:_SNIPPET_CHARS] for c in chunks]
+        scores = _predict_max(model, query, texts)
+        return float(max(scores)) if scores else None
     except Exception as e:
         logger.warning("top_relevance scoring failed: %s", e)
         return None
