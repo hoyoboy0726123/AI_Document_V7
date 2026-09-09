@@ -185,6 +185,10 @@ class Settings(BaseSettings):
     RAG_TABLE_ROWWISE_TOP: int = 1
     RAG_HYBRID_SEARCH: bool = True
     RAG_RRF_K: int = 60                         # RRF 常數，越大越平滑（標準值 60）
+    # 混合模式的 RAG 分支：主 LLM 是本地 Ollama 時，先把第一版答案逐字串流給前端
+    # （打字機效果），校驗與補查後的完整答案再以 final 事件覆蓋。雲端 provider
+    # （AiHub 閘道不支援串流）維持原本「整段回」的行為，此開關對它無效。
+    RAG_HYBRID_STREAM: bool = True
     # 中文查詢救援：語料是英文規範、使用者用中文問時，FTS5 trigram 會把整句中文當成
     # 單一片語，實測 12 題全部 0 命中 —— 混合檢索的關鍵字那一半等於空轉。
     # 開啟後「只在 BM25 撈到 0 筆且查詢含中文」時，才用 LLM 轉成英文檢索詞重試一次。

@@ -504,6 +504,14 @@ const QAConsolePage = () => {
               : null);
             return;
           }
+          if (eventName === "content") {
+            // 本地 Ollama 的逐字串流：先累積第一版草稿（打字機效果），
+            // final 事件會以校驗與補查後的完整答案整段覆蓋，不會殘留草稿。
+            setStreaming((prev) => prev
+              ? { ...prev, answer: (prev.answer || "") + (data.text || ""), thinkingDone: true }
+              : null);
+            return;
+          }
           setStreaming((prev) => prev ? { ...prev, agentSteps: [...(prev.agentSteps || []), { event: eventName, ...data }] } : null);
         },
         onFinal: (data) => {
