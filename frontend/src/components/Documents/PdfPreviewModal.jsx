@@ -2,6 +2,10 @@
 import { Modal, Space, Button, Typography, Spin, Input, Card, Divider, message, Tag } from "antd";
 import { PlusOutlined, MinusOutlined, LeftOutlined, RightOutlined, RobotOutlined, SendOutlined, EyeOutlined, DeleteOutlined, CopyOutlined, SaveOutlined } from "@ant-design/icons";
 import { Document, Page, pdfjs } from "react-pdf";
+// 文字層樣式：renderTextLayer 需要這份 CSS 才會把文字層「透明地疊在頁面上」
+// （可反白選取、「標示引用位置」的 <mark> 才會落在原文位置）。少了它，
+// pdf.js 抽出的原生文字會以一般文字直接印在頁面下方，看起來像多了一份內容。
+import "react-pdf/dist/Page/TextLayer.css";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
