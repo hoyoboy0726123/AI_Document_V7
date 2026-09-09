@@ -61,6 +61,15 @@ class SPAStaticFiles(StaticFiles):
             raise
 
 
+# .mjs 的 MIME 型別：Starlette StaticFiles 用 Python mimetypes 猜型別，而 Windows 的
+# 登錄檔把 .mjs 對到 text/plain（Linux 也不保證有登錄）。react-pdf 的 pdf.js worker
+# 是 ES module worker（pdf.worker-*.mjs），瀏覽器對非 JavaScript MIME 的模組 worker
+# 一律拒絕載入，PDF 預覽就只剩「Failed to load PDF file.」——API 本身正常（curl 200）。
+# 實測本機 /assets/pdf.worker-*.mjs 回 text/plain; charset=utf-8。
+import mimetypes
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("application/javascript", ".js")
+
 # 掛載前端靜態檔案到根目錄
 if os.path.exists(static_dir):
     app.mount("/", SPAStaticFiles(directory=static_dir, html=True), name="static")
