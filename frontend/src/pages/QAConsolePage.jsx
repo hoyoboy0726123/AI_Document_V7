@@ -513,8 +513,11 @@ const QAConsolePage = () => {
           if (eventName === "content") {
             // 本地 Ollama 的逐字串流：先累積第一版草稿（打字機效果），
             // final 事件會以校驗與補查後的完整答案整段覆蓋，不會殘留草稿。
+            // 第一個字到達就把先行來源收回去（sourcesPreliminary=false）：先行來源
+            // 展開是為了「整段生成要等 20 秒」的空窗期設計的，有串流時它反而把
+            // 逐字出現的答案推到視窗上方看不見。與純 RAG 串流的做法一致。
             setStreaming((prev) => prev
-              ? { ...prev, answer: (prev.answer || "") + (data.text || ""), thinkingDone: true }
+              ? { ...prev, answer: (prev.answer || "") + (data.text || ""), thinkingDone: true, sourcesPreliminary: false }
               : null);
             return;
           }
