@@ -56,11 +56,22 @@ const PdfPreviewModal = ({
     let cancelled = false;
     setLocateData(null);
     setLocating(true);
+    // 逾時放寬到 3 分鐘：圖片頁走 OCR，後端第一次用到 OCR 要先載入模型（實測冷啟動
+    // 近兩分鐘，之後每頁約 2 秒），原本的 60 秒會在使用者第一次點的時候靜默失敗、
+    // 什麼都不顯示。失敗與逾時改為明講，而不是無聲無息。
     apiClient
       .post(`documents/${documentId}/page/${pageNumber}/locate`,
-        { snippet: highlightSnippet }, { timeout: 60000 })
-      .then((r) => { if (!cancelled) setLocateData(r.data); })
-      .catch(() => { if (!cancelled) setLocateData(null); })
+        { snippet: highlightSnippet }, { timeout: 180000 })
+      .then((r) => {
+        if (cancelled) return;
+        setLocateData(r.data);
+        if (!r.data?.rects?.length) message.info("這一頁找不到與引用片段對應的位置");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLocateData(null);
+        message.warning(err?.code === "ECONNABORTED" ? "引用定位逾時（OCR 模型載入中），請稍後再按一次" : "引用定位失敗");
+      })
       .finally(() => { if (!cancelled) setLocating(false); });
     return () => { cancelled = true; };
   }, [open, documentId, pageNumber, highlightSnippet, highlightOn]);

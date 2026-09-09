@@ -278,6 +278,10 @@ class Settings(BaseSettings):
     # ≥0.4(離題 ≈0.00），故門檻設 0.15 可乾淨分開。低於此值時不硬答，改回「最接近的內容
     # ＋ LLM 動態產生的查詢修正建議」。CE 不可用時此 gate 自動略過（不退化）。
     RAG_LOWCONF_CE_THRESHOLD: float = 0.15
+    # 啟動時在背景先把 RapidOCR 引擎（版面／表格／文字三個模型）載好。引擎是第一次
+    # 用到才建，實測冷啟動近兩分鐘（含模型下載），「標示引用位置」在圖片頁第一次按
+    # 就會逾時。預熱在背景執行緒進行，不擋啟動；記憶體吃緊的機器可關掉。
+    OCR_WARMUP_ON_STARTUP: bool = True
     RAG_RERANK_CE_MIN_SCORE: float = 0.0        # cross-encoder 分數門檻（logit，>0 偏相關）
     # keyword-only 候選（無向量分數、純字面命中）進最終 top_k 的 CE 門檻。
     # 預設 None = 不啟用。注意 0.0 不是「關閉」—— CE 對相關塊打負 logit 很常見，
