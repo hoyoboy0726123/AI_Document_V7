@@ -8,10 +8,13 @@ import remarkGfm from "remark-gfm";
 import useAuthStore from "../../stores/authStore";
 import apiClient from "../../services/api";
 
+// 查詢字串是快取破壞：worker 檔名由內容雜湊決定，伺服器修正 .mjs 的 MIME 型別後
+// 檔名不變，已造訪過的瀏覽器會繼續用快取裡 text/plain 的舊回應，模組 worker 照樣
+// 載入失敗（「Failed to load PDF file.」）。換一個 URL 才能確保重新抓取。
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.mjs",
   import.meta.url,
-).toString();
+).toString() + "?v=2";
 
 const DEFAULT_MAX_ANALYSIS_PAGES = 10;
 
