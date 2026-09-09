@@ -177,6 +177,7 @@ def _chat_with_provider(
     model: Optional[str] = None,
     response_format: Optional[Any] = None,
     think: bool = False,
+    options: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Provider-aware chat: honour the configured LLM_PROVIDER.
 
@@ -184,26 +185,31 @@ def _chat_with_provider(
     is Ollama-specific). Any cloud provider (e.g. Gemini) goes through the
     provider abstraction so switching providers in admin/.env actually routes
     RAG synthesis there instead of always hitting Ollama.
+
+    options：呼叫端可加的取樣參數（例如短 JSON 呼叫用 num_predict 封頂輸出長度），
+    會與預設參數合併；千萬不要在這裡覆寫 num_ctx —— Ollama 會把不同 num_ctx 當成
+    不同 runner 而重載主模型。
     """
     from .llm_provider import get_llm_provider
 
     provider = get_llm_provider()
     if getattr(provider, "name", "ollama") == "ollama":
         return _chat_with_ollama(
-            messages, model=model, response_format=response_format, think=think
+            messages, model=model, response_format=response_format, think=think,
+            options=options,
         )
     # 取樣參數要跟著送。這個分支原本完全不帶 options，於是雲端 provider 用
     # 服務端預設溫度（非 0），同一題每次答案都不同 —— 本地路徑早就設了
     # temperature=0 + seed，等於「換一個 provider 就失去可重現性」，而
     # 改動前後比較（golden set / A-B 測試）全都建立在可重現性上。
     # 四個 provider（base / ollama / gemini / aihub）的 chat 都收 options。
-    options = {}
+    merged = dict(options or {})
     if getattr(settings, "OLLAMA_TEMPERATURE", None) is not None:
-        options["temperature"] = settings.OLLAMA_TEMPERATURE
+        merged.setdefault("temperature", settings.OLLAMA_TEMPERATURE)
     import time
     t0 = time.time()
     result = provider.chat(messages, model=model, format=response_format,
-                           options=options or None)
+                           options=merged or None)
     logger.info("_chat_with_provider provider=%s elapsed=%.1fs output_len=%d preview=%s",
                 provider.name, time.time() - t0, len(result), repr(result[:120]))
     return result
@@ -573,6 +579,22 @@ def generate_rag_answer_stream(
             yield {"type": "content", "text": text}
 
 
+def finalize_streamed_answer(text: str) -> str:
+    """串流片段拼回整段後，套用與 client.chat 整段回應相同的後處理。
+
+    整段版在 ollama_client.chat 裡會做「取最終答案（去推理標記）→ 壓抑重複 → 去控制
+    符」，串流版拿到的是原始片段；混合模式把串流草稿當作第一版答案接補查與校驗，
+    兩邊必須是同一種文字，否則 _needs_deeper_search 等判斷會看到不同的輸入。
+    """
+    from .ollama_client import _extract_final_answer, _squelch_repetition, _strip_control_tokens
+    raw = text or ""
+    try:
+        return _strip_control_tokens(_squelch_repetition(_extract_final_answer(raw))) or raw
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("finalize_streamed_answer 後處理失敗，沿用原文: %s", exc)
+        return raw
+
+
 _EMBED_MAX_CHARS = 7000  # qwen3-embedding:8b supports 8192 tokens (~7000 English chars)
 _EMBED_BATCH_SIZE = 10   # process N chunks per request to avoid timeout
 
@@ -712,9 +734,14 @@ Cases where the current question ALREADY has its own subject — keep it as-is:
 Return JSON strictly following the schema.
 """
 
+    # 輸出封頂：這個呼叫只該回一小段 JSON（四個欄位）。實測 gemma4:12b 在追問
+    # 「Procedure I 執行細節」時失控生成 9,053 字直到 num_predict=6000 才停
+    # （88.6 秒，done_reason=length），JSON 解析失敗後才退回原問句 —— 使用者等了
+    # 一分半才開始檢索。512 個 token 足夠放最長的改寫句，失控時最多多花幾秒。
     raw = _chat_with_provider(
         [{"role": "user", "content": prompt}],
         response_format=FOLLOWUP_INTENT_SCHEMA,
+        options={"num_predict": 512},
     )
     payload = _safe_json_loads(raw)
     return {

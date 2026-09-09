@@ -298,6 +298,33 @@ apply_llm_overrides_from_db()
 apply_ocr_overrides_from_db()
 apply_llm_concurrency_from_db()
 
+
+def warm_up_ocr_engines() -> None:
+    """背景預熱 RapidOCR 引擎（OCR_WARMUP_ON_STARTUP）。
+
+    引擎（版面／表格／文字三個模型）原本是第一次用到才建，實測冷啟動近兩分鐘，
+    「標示引用位置」在掃描圖頁第一次按下去就逾時、畫面上什麼都沒有。
+    放在 daemon 執行緒，不擋啟動；_get_engines 內有鎖，預熱期間的請求會等它做完。
+    """
+    if not getattr(settings, "OCR_WARMUP_ON_STARTUP", True):
+        return
+    import threading
+    import time
+
+    def _run() -> None:
+        t0 = time.time()
+        try:
+            from .services import rapid_ocr
+            rapid_ocr._get_engines()
+            logger.info("OCR 引擎預熱完成（%.0f 秒）", time.time() - t0)
+        except Exception as exc:  # noqa: BLE001 — 預熱失敗不影響啟動，第一次使用時再載入
+            logger.warning("OCR 引擎預熱失敗（第一次使用時再載入）: %s", exc)
+
+    threading.Thread(target=_run, name="ocr-warmup", daemon=True).start()
+
+
+warm_up_ocr_engines()
+
 # Start the single serial KG worker (KG extraction is funneled through it to avoid
 # concurrent SQLite writers; see services/kg_queue.py).
 from .services import kg_queue as _kg_queue

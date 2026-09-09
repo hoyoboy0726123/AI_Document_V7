@@ -96,7 +96,10 @@ export const renderThinking = (thinking, isLive, thinkingDone) => {
   );
 };
 
-export const renderAgentSteps = (steps, isLive) => {
+export const renderAgentSteps = (steps, isLive, collapsed = false) => {
+  // collapsed：答案已開始逐字出現 → 收合時間軸，避免它把串流中的答案推出視窗。
+  // 用 key 讓 Collapse 在「展開→收合」那一刻重新掛載（defaultActiveKey 只在掛載時生效），
+  // 使用者之後仍可手動點開。
   if (!steps || steps.length === 0) {
     if (isLive) {
       return (
@@ -157,20 +160,30 @@ export const renderAgentSteps = (steps, isLive) => {
         ),
       };
     });
+  // 標題列摘要：收合後仍看得到用了哪些工具（去重、保持出現順序）
+  const toolsUsed = [];
+  steps.forEach((s) => {
+    if (s.event === "tool_call" && s.tool && !toolsUsed.includes(s.tool)) toolsUsed.push(s.tool);
+  });
+  const open = isLive && !collapsed;
   return (
     <Collapse
+      key={open ? "open" : "collapsed"}
       size="small"
       ghost
-      defaultActiveKey={isLive ? ["agent"] : []}
+      defaultActiveKey={open ? ["agent"] : []}
       style={{ marginBottom: 8 }}
       items={[
         {
           key: "agent",
           label: (
-            <Space>
+            <Space wrap>
               <RobotOutlined style={{ color: "#1677ff" }} />
               <Text strong style={{ fontSize: 13 }}>Agent 推理過程</Text>
               <Tag color="blue" style={{ fontSize: 11 }}>{items.length} 步</Tag>
+              {toolsUsed.length > 0 && (
+                <Text type="secondary" style={{ fontSize: 12 }}>工具：{toolsUsed.join("、")}</Text>
+              )}
               {isLive && !steps.some((s) => s.event === "final") && (
                 <Tag color="processing" style={{ fontSize: 11 }}>進行中</Tag>
               )}

@@ -169,6 +169,9 @@ def agent_route(
                         db, question, conversation_history=history, out_meta=meta):
                     if _kind == "sources":
                         yield _sse("sources", {"sources": _payload})
+                    elif _kind == "content":
+                        # Ollama 串流：第一版草稿逐字送出，final 會以校驗後的完整答案覆蓋
+                        yield _sse("content", {"text": _payload})
                     elif _kind == "final":
                         final_text, final_sources = _payload
                         yield _sse("final", {

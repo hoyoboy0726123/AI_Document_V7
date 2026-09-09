@@ -9,10 +9,11 @@ import apiClient from "../../services/api";
 import useAuthStore from "../../stores/authStore";
 import PdfPreviewModal from "./PdfPreviewModal";
 
+// 查詢字串是快取破壞（見 PdfPreviewModal.jsx 的說明）
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.mjs",
   import.meta.url,
-).toString();
+).toString() + "?v=2";
 import "./DocumentDetail.css";
 
 const DocumentDetail = ({ documentId, initialPage, initialHighlightKeyword, onBack, onEdit }) => {

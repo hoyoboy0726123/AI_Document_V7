@@ -425,6 +425,12 @@ const QAConsolePage = () => {
     try {
       await postAgentStream({ question, conversation_history: historyForAgent, max_steps: 8, top_k: 5, ...buildScopePayload(), conversation_id: activeConvIdRef.current }, {
         onEvent: (eventName, data) => {
+          if (eventName === "content") {
+            // 本地 Ollama：工具迴圈結束後，最終答案的第一版逐字送出（打字機效果）；
+            // final 事件會以補查與校驗後的完整答案整段覆蓋。不進 agentSteps。
+            setStreaming((prev) => prev ? { ...prev, answer: (prev.answer || "") + (data.text || "") } : null);
+            return;
+          }
           setStreaming((prev) => prev ? {
             ...prev,
             agentSteps: [...(prev.agentSteps || []), { event: eventName, ...data }],
@@ -501,6 +507,17 @@ const QAConsolePage = () => {
             // thinkingDone 一併打開，renderSources 才會顯示。
             setStreaming((prev) => prev
               ? { ...prev, sources: data.sources || [], thinkingDone: true, sourcesPreliminary: true }
+              : null);
+            return;
+          }
+          if (eventName === "content") {
+            // 本地 Ollama 的逐字串流：先累積第一版草稿（打字機效果），
+            // final 事件會以校驗與補查後的完整答案整段覆蓋，不會殘留草稿。
+            // 第一個字到達就把先行來源收回去（sourcesPreliminary=false）：先行來源
+            // 展開是為了「整段生成要等 20 秒」的空窗期設計的，有串流時它反而把
+            // 逐字出現的答案推到視窗上方看不見。與純 RAG 串流的做法一致。
+            setStreaming((prev) => prev
+              ? { ...prev, answer: (prev.answer || "") + (data.text || ""), thinkingDone: true, sourcesPreliminary: false }
               : null);
             return;
           }
@@ -961,7 +978,9 @@ const QAConsolePage = () => {
                     </div>
                     <Card size="small" style={{ background: "#f9f9f9", borderLeft: streamingMsg.agentMode ? "4px solid #1677ff" : "4px solid #52c41a" }}>
                       {/* Agent steps timeline (when in agent mode) */}
-                      {streamingMsg.agentMode && renderAgentSteps(streamingMsg.agentSteps, true)}
+                      {/* 答案開始逐字出現後把推理過程收合：時間軸動輒佔滿整個視窗，
+                          會把正在串流的答案推到看不見的地方；標題列仍看得到步數與用過的工具。 */}
+                      {streamingMsg.agentMode && renderAgentSteps(streamingMsg.agentSteps, true, Boolean(streamingMsg.answer))}
                       {/* Thinking: expanded while thinking, collapsed after done */}
                       {!streamingMsg.agentMode && renderThinking(streamingMsg.thinking, true, streamingMsg.thinkingDone)}
                       <div style={{ fontSize: 15, lineHeight: 1.8 }}>

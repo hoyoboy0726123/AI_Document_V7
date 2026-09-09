@@ -2,16 +2,23 @@
 import { Modal, Space, Button, Typography, Spin, Input, Card, Divider, message, Tag } from "antd";
 import { PlusOutlined, MinusOutlined, LeftOutlined, RightOutlined, RobotOutlined, SendOutlined, EyeOutlined, DeleteOutlined, CopyOutlined, SaveOutlined } from "@ant-design/icons";
 import { Document, Page, pdfjs } from "react-pdf";
+// 文字層樣式：renderTextLayer 需要這份 CSS 才會把文字層「透明地疊在頁面上」
+// （可反白選取、「標示引用位置」的 <mark> 才會落在原文位置）。少了它，
+// pdf.js 抽出的原生文字會以一般文字直接印在頁面下方，看起來像多了一份內容。
+import "react-pdf/dist/Page/TextLayer.css";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import useAuthStore from "../../stores/authStore";
 import apiClient from "../../services/api";
 
+// 查詢字串是快取破壞：worker 檔名由內容雜湊決定，伺服器修正 .mjs 的 MIME 型別後
+// 檔名不變，已造訪過的瀏覽器會繼續用快取裡 text/plain 的舊回應，模組 worker 照樣
+// 載入失敗（「Failed to load PDF file.」）。換一個 URL 才能確保重新抓取。
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.mjs",
   import.meta.url,
-).toString();
+).toString() + "?v=2";
 
 const DEFAULT_MAX_ANALYSIS_PAGES = 10;
 
@@ -49,11 +56,22 @@ const PdfPreviewModal = ({
     let cancelled = false;
     setLocateData(null);
     setLocating(true);
+    // 逾時放寬到 3 分鐘：圖片頁走 OCR，後端第一次用到 OCR 要先載入模型（實測冷啟動
+    // 近兩分鐘，之後每頁約 2 秒），原本的 60 秒會在使用者第一次點的時候靜默失敗、
+    // 什麼都不顯示。失敗與逾時改為明講，而不是無聲無息。
     apiClient
       .post(`documents/${documentId}/page/${pageNumber}/locate`,
-        { snippet: highlightSnippet }, { timeout: 60000 })
-      .then((r) => { if (!cancelled) setLocateData(r.data); })
-      .catch(() => { if (!cancelled) setLocateData(null); })
+        { snippet: highlightSnippet }, { timeout: 180000 })
+      .then((r) => {
+        if (cancelled) return;
+        setLocateData(r.data);
+        if (!r.data?.rects?.length) message.info("這一頁找不到與引用片段對應的位置");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLocateData(null);
+        message.warning(err?.code === "ECONNABORTED" ? "引用定位逾時（OCR 模型載入中），請稍後再按一次" : "引用定位失敗");
+      })
       .finally(() => { if (!cancelled) setLocating(false); });
     return () => { cancelled = true; };
   }, [open, documentId, pageNumber, highlightSnippet, highlightOn]);

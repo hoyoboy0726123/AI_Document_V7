@@ -903,8 +903,13 @@ def _grounded_synthesis(
     *,
     ensure_values: bool = True,
     retry_budget: Optional[List[int]] = None,
+    first_result: Optional[tuple] = None,
 ) -> tuple:
     """外層包裝：合成一次，若答案缺數值就自己補查再合成，直到夠用或試完。
+
+    first_result：呼叫端已經用 _synthesize_grounded_stream 串流出第一版答案時，
+    把那份 (answer, sources, n_used, n_total) 傳進來，這裡就不再生成第一次，
+    直接接補查迴圈與查核——串流只是把同一次生成提早顯示，不多花一次模型呼叫。
 
     為什麼放在這裡而不是流程末端：`run_agent` 有 9 個「產出最終答案」的出口，
     其中 8 個會提早 return，繞過末端的補救迴圈。實測同一個問題在不同輪次會走到
@@ -915,8 +920,11 @@ def _grounded_synthesis(
     那些不是要交給使用者的最終答案，不值得多花幾輪檢索。
     """
     rag_evidence = _drop_off_topic(question, rag_evidence)
-    ans, sources, n_used, n_total = _synthesize_grounded(
-        db, question, rag_evidence, kg_notes, conversation_history)
+    if first_result is not None:
+        ans, sources, n_used, n_total = first_result
+    else:
+        ans, sources, n_used, n_total = _synthesize_grounded(
+            db, question, rag_evidence, kg_notes, conversation_history)
     if not ensure_values:
         _ctx = [{"text": e.get("snippet") or e.get("text") or ""} for e in rag_evidence]
         return _flag_unverified_premise(
@@ -1183,16 +1191,20 @@ def _degrade_empty_tables(answer: Optional[str]) -> Optional[str]:
     return "\n".join(out)
 
 
-def _synthesize_grounded(
+def _grounded_contexts(
     db: Session,
     question: str,
     rag_evidence: List[Dict[str, Any]],
     kg_notes: List[str],
-    conversation_history: Optional[List[Dict[str, Any]]],
 ) -> tuple:
-    """Phase 0：用已調好的 RAG grounding prompt 重新生成最終答案。
+    """Phase 0 的前半：把證據去重、依預算裝進編號 context。
 
-    回傳 (answer, n_rag_used, n_rag_total_unique)，後兩者供 Phase 3 完整度反問使用。
+    回傳 (contexts, used_sources, n_rag_used, n_rag_total_unique)；contexts 為空表示
+    沒有可用證據。_synthesize_grounded（整段生成）與 _synthesize_grounded_stream
+    （逐字串流）共用這一段，兩條路徑餵給模型的內容因此完全相同。
+
+    原本這段與 LLM 呼叫寫在同一個函式；拆開是為了讓混合模式在本地 Ollama 時能
+    先逐字送出第一版答案，而不必複製一份預算與編號邏輯。
 
     把 ReAct 過程蒐集到的 rag_search 命中段落（含 title/page）+ KG 關聯整理成
     編號 context，套用「只能依段落、標 [來源]、不可跨來源拼湊」的 RAG 模板再生成一次，
@@ -1278,6 +1290,23 @@ def _synthesize_grounded(
                 "score": None,
             })
 
+    return contexts, used_sources, n_rag_used, total_unique
+
+
+def _synthesize_grounded(
+    db: Session,
+    question: str,
+    rag_evidence: List[Dict[str, Any]],
+    kg_notes: List[str],
+    conversation_history: Optional[List[Dict[str, Any]]],
+) -> tuple:
+    """Phase 0：用已調好的 RAG grounding prompt 重新生成最終答案。
+
+    回傳 (answer, used_sources, n_rag_used, n_rag_total_unique)，後兩者供 Phase 3
+    完整度反問使用。
+    """
+    contexts, used_sources, n_rag_used, total_unique = _grounded_contexts(
+        db, question, rag_evidence, kg_notes)
     if not contexts:
         return None, [], 0, total_unique
 
@@ -1295,6 +1324,54 @@ def _synthesize_grounded(
     # 等於警示訊息把補救機制關掉了（實測數值落地率因此掉 1 題）。
     # 查核改在 _grounded_synthesis 的迴圈結束後做一次。
     return answer, used_sources, n_rag_used, total_unique
+
+
+def _stream_first_draft_enabled() -> bool:
+    """第一版答案是否逐字串流：RAG_HYBRID_STREAM 開著、且主 LLM 是本地 Ollama。
+
+    AiHub 等雲端閘道不支援串流，維持整段回；這裡是混合模式 RAG 分支與 Agent
+    最終合成共用的判斷，兩邊行為一致。
+    """
+    if not getattr(settings, "RAG_HYBRID_STREAM", True):
+        return False
+    try:
+        from .llm_provider import get_llm_provider
+        return getattr(get_llm_provider(), "name", "ollama") == "ollama"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _synthesize_grounded_stream(
+    db: Session,
+    question: str,
+    rag_evidence: List[Dict[str, Any]],
+    kg_notes: List[str],
+    conversation_history: Optional[List[Dict[str, Any]]],
+):
+    """_synthesize_grounded 的逐字串流版（只在本地 Ollama 使用）。
+
+    產出 ("content", 片段文字) 事件，最後一個事件是 ("result", (answer, used_sources,
+    n_rag_used, n_rag_total_unique))——與 _synthesize_grounded 的回傳值同形，可直接
+    當作 _grounded_synthesis 的 first_result，讓補查迴圈、來源查核、引用校驗照舊
+    在完整文字上執行；前端拿到 final 後整段覆蓋草稿。
+    """
+    contexts, used_sources, n_rag_used, total_unique = _grounded_contexts(
+        db, question, rag_evidence, kg_notes)
+    if not contexts:
+        yield ("result", (None, [], 0, total_unique))
+        return
+    prompts = SystemConfigService(db).get_rag_prompts()
+    parts: List[str] = []
+    for chunk in ai.generate_rag_answer_stream(
+            question, contexts, conversation_history=conversation_history,
+            system_prompt=prompts["system_prompt"], user_template=prompts["user_template"]):
+        if chunk.get("type") == "content" and chunk.get("text"):
+            parts.append(chunk["text"])
+            yield ("content", chunk["text"])
+    # 串流拿到的是原始片段；整段版在 client.chat 裡還會做去推理標記／段落去重，
+    # 這裡補做同一套，讓草稿與整段生成的結果一致。
+    answer = ai.finalize_streamed_answer("".join(parts))
+    yield ("result", (answer, used_sources, n_rag_used, total_unique))
 
 
 def _coverage_note(n_unused_sources: int, kg_edges_seen: int) -> str:
@@ -1579,8 +1656,31 @@ def run_rag_only_events(db: Session, question: str,
             yield ("final", (ai.low_confidence_answer(question, closest), low_src))
             return
 
+    # 本地 Ollama：第一版答案逐字送出（打字機效果），讓使用者不必盯著空白等整段；
+    # 補查迴圈、來源查核、引用校驗照舊在完整文字上做，final 事件整段覆蓋草稿。
+    # 雲端 provider（AiHub 閘道不支援串流）走原本的整段路徑，行為完全不變。
+    first_result = None
+    if getattr(settings, "RAG_HYBRID_STREAM", True):
+        try:
+            from .llm_provider import get_llm_provider
+            _is_ollama = getattr(get_llm_provider(), "name", "ollama") == "ollama"
+        except Exception:  # noqa: BLE001
+            _is_ollama = False
+        if _is_ollama:
+            _stream_ev = _drop_off_topic(question, seeded)   # 與 _grounded_synthesis 內同一套過濾
+            try:
+                for _kind, _payload in _synthesize_grounded_stream(
+                        db, question, _stream_ev, [], conversation_history):
+                    if _kind == "content":
+                        yield ("content", _payload)
+                    else:
+                        first_result = _payload
+            except Exception as exc:  # noqa: BLE001 — 串流失敗就退回整段生成，不能讓答案消失
+                logger.warning("混合模式串流合成失敗，改走整段生成: %s", exc)
+                first_result = None
     ans, sources, n_used, n_total = _grounded_synthesis(db, question, seeded, [], conversation_history,
-                                                    retry_budget=_new_retry_budget())
+                                                    retry_budget=_new_retry_budget(),
+                                                    first_result=first_result)
     if ans and ans.strip():
         note = _coverage_note(max(0, n_total - n_used), 0)
         # 問句沒有可辨識主體時，標明答案是依哪個 Method 的段落推斷的（見 _inferred_subject_afterword）
@@ -2792,14 +2892,18 @@ def run_agent(
     # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。
     final_sources: List[Dict[str, Any]] = []
 
-    def _synthesize():
-        """用目前的 rag_evidence + kg_notes 跑帶引用的合成，回傳 (答案含覆蓋反問, 來源, n_used)。"""
+    def _synthesize(first_result=None):
+        """用目前的 rag_evidence + kg_notes 跑帶引用的合成，回傳 (答案含覆蓋反問, 來源, n_used)。
+
+        first_result：已經逐字串流出去的第一版 (answer, sources, n_used, n_total)，
+        傳入後不再生成第一次，直接接補查迴圈與查核（見 _grounded_synthesis）。
+        """
         if not (rag_evidence or kg_notes):
             return None, [], 0
         try:
             g, srcs, n_used, n_total = _grounded_synthesis(
                 db, question, rag_evidence, kg_notes, conversation_history,
-                retry_budget=_budget,
+                retry_budget=_budget, first_result=first_result,
             )
             if g and g.strip():
                 note = _coverage_note(max(0, n_total - n_used), kg_edges_seen)
@@ -2808,7 +2912,27 @@ def run_agent(
             logger.warning("grounded synthesis failed: %s", e)
         return None, [], 0
 
-    synth, syn_sources, n_used = _synthesize()
+    # 本地 Ollama：最終答案的第一版逐字串流（打字機效果），與混合模式 RAG 分支
+    # 同一機制 —— 工具迴圈那幾十秒省不掉，但省掉最後盯著空白等 20 秒。
+    # 補查迴圈、來源查核、引用校驗照舊在完整文字上做，final 事件整段覆蓋草稿；
+    # 雲端 provider（AiHub 閘道不支援串流）維持整段生成。串流失敗自動退回整段。
+    _first_result = None
+    if (rag_evidence or kg_notes) and _stream_first_draft_enabled():
+        try:
+            _stream_ev = _drop_off_topic(question, rag_evidence)
+            for _kind, _payload in _synthesize_grounded_stream(
+                    db, question, _stream_ev, kg_notes, conversation_history):
+                if _kind == "content":
+                    yield {"type": "content", "text": _payload}
+                elif _kind == "result":
+                    _first_result = _payload
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent 最終答案串流失敗，退回整段生成: %s", exc)
+            _first_result = None
+        if _first_result is not None and not (_first_result[0] or "").strip():
+            _first_result = None   # 串流沒產出文字 → 讓整段路徑自己再生成一次
+
+    synth, syn_sources, n_used = _synthesize(_first_result)
 
     # 充足性檢查（確定性，不靠 LLM）：合成不出，或「迴圈完全沒撈到 KG 關聯且 seed 向量信心偏低」
     # → 答案只靠弱向量證據，視為不足，自動補充一輪（更廣檢索 + 規範關聯展開）後重新合成。

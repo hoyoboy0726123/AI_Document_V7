@@ -292,7 +292,8 @@ def _translate_options(dedicated_model: Optional[str]) -> Dict[str, object]:
     （沿用 _default_options 的 OLLAMA_NUM_CTX），只有 RAG_TRANSLATE_MODEL 指定的
     專用小模型才用小 context 省 VRAM。
     """
-    opts: Dict[str, object] = {"temperature": 0.0}
+    # 輸出只該是 2–4 個關鍵詞；封頂 64 個 token，模型失控時最多多花不到一秒。
+    opts: Dict[str, object] = {"temperature": 0.0, "num_predict": 64}
     if dedicated_model:
         opts["num_ctx"] = 2048
     return opts
