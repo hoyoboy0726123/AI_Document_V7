@@ -1326,6 +1326,21 @@ def _synthesize_grounded(
     return answer, used_sources, n_rag_used, total_unique
 
 
+def _stream_first_draft_enabled() -> bool:
+    """第一版答案是否逐字串流：RAG_HYBRID_STREAM 開著、且主 LLM 是本地 Ollama。
+
+    AiHub 等雲端閘道不支援串流，維持整段回；這裡是混合模式 RAG 分支與 Agent
+    最終合成共用的判斷，兩邊行為一致。
+    """
+    if not getattr(settings, "RAG_HYBRID_STREAM", True):
+        return False
+    try:
+        from .llm_provider import get_llm_provider
+        return getattr(get_llm_provider(), "name", "ollama") == "ollama"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _synthesize_grounded_stream(
     db: Session,
     question: str,
@@ -2877,14 +2892,18 @@ def run_agent(
     # Phase 0/3：合成 → 充足性檢查 → 不足則自動補充一輪 → 重新合成 → 仍不足才低信心兜底。
     final_sources: List[Dict[str, Any]] = []
 
-    def _synthesize():
-        """用目前的 rag_evidence + kg_notes 跑帶引用的合成，回傳 (答案含覆蓋反問, 來源, n_used)。"""
+    def _synthesize(first_result=None):
+        """用目前的 rag_evidence + kg_notes 跑帶引用的合成，回傳 (答案含覆蓋反問, 來源, n_used)。
+
+        first_result：已經逐字串流出去的第一版 (answer, sources, n_used, n_total)，
+        傳入後不再生成第一次，直接接補查迴圈與查核（見 _grounded_synthesis）。
+        """
         if not (rag_evidence or kg_notes):
             return None, [], 0
         try:
             g, srcs, n_used, n_total = _grounded_synthesis(
                 db, question, rag_evidence, kg_notes, conversation_history,
-                retry_budget=_budget,
+                retry_budget=_budget, first_result=first_result,
             )
             if g and g.strip():
                 note = _coverage_note(max(0, n_total - n_used), kg_edges_seen)
@@ -2893,7 +2912,27 @@ def run_agent(
             logger.warning("grounded synthesis failed: %s", e)
         return None, [], 0
 
-    synth, syn_sources, n_used = _synthesize()
+    # 本地 Ollama：最終答案的第一版逐字串流（打字機效果），與混合模式 RAG 分支
+    # 同一機制 —— 工具迴圈那幾十秒省不掉，但省掉最後盯著空白等 20 秒。
+    # 補查迴圈、來源查核、引用校驗照舊在完整文字上做，final 事件整段覆蓋草稿；
+    # 雲端 provider（AiHub 閘道不支援串流）維持整段生成。串流失敗自動退回整段。
+    _first_result = None
+    if (rag_evidence or kg_notes) and _stream_first_draft_enabled():
+        try:
+            _stream_ev = _drop_off_topic(question, rag_evidence)
+            for _kind, _payload in _synthesize_grounded_stream(
+                    db, question, _stream_ev, kg_notes, conversation_history):
+                if _kind == "content":
+                    yield {"type": "content", "text": _payload}
+                elif _kind == "result":
+                    _first_result = _payload
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent 最終答案串流失敗，退回整段生成: %s", exc)
+            _first_result = None
+        if _first_result is not None and not (_first_result[0] or "").strip():
+            _first_result = None   # 串流沒產出文字 → 讓整段路徑自己再生成一次
+
+    synth, syn_sources, n_used = _synthesize(_first_result)
 
     # 充足性檢查（確定性，不靠 LLM）：合成不出，或「迴圈完全沒撈到 KG 關聯且 seed 向量信心偏低」
     # → 答案只靠弱向量證據，視為不足，自動補充一輪（更廣檢索 + 規範關聯展開）後重新合成。
